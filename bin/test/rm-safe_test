@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+
+fails=0
+tests=0
+skips=0
+
+. "$HOME/dotfiles/bin/src/capture.bash"
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_DIR=$(mktemp -d --tmpdir rm-safe-test.XXXXXX)
+trap 'command -p rm -rf "$TEST_DIR"' EXIT
+
+HOME_DIR="$TEST_DIR/home"
+XDG_DIR="$TEST_DIR/xdg"
+WORK_DIR="$TEST_DIR/work"
+BIN_DIR="$TEST_DIR/bin"
+BASH_DIR="$(dirname "$(command -v bash)")"
+HOST_PATH="$PATH"
+PATH_BASE="$BIN_DIR:$BASH_DIR:$REPO_ROOT/bin:$HOST_PATH"
+
+mkdir -p "$HOME_DIR" "$XDG_DIR" "$WORK_DIR" "$BIN_DIR"
+
+cat >"$BIN_DIR/gio" <<'GIO'
+#!/usr/bin/env bash
+exit 1
+GIO
+chmod +x "$BIN_DIR/gio"
+
+cat >"$BIN_DIR/trash-put" <<'TRASHPUT'
+#!/usr/bin/env bash
+exit 1
+TRASHPUT
+chmod +x "$BIN_DIR/trash-put"
+
+if [[ $(uname) == "Darwin" ]]; then
+	TRASH_BASE="$HOME_DIR/.Trash"
+else
+	TRASH_BASE="$XDG_DIR/Trash"
+fi
+
+TRASH_FILES="$TRASH_BASE/files"
+TRASH_INFO="$TRASH_BASE/info"
+LOG_FILE="$TRASH_BASE/rm_safe.log"
+
+reset_trash() {
+	mkdir -p "$TRASH_FILES" "$TRASH_INFO"
+	find "$TRASH_FILES" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} + 2>/dev/null || true
+	find "$TRASH_INFO" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} + 2>/dev/null || true
+	: >"$LOG_FILE"
+}
+
+skip_test() {
+	local name=$1
+	local reason=$2
+	echo "SKIP $name: $reason" >&2
+	((skips++))
+}
+
+path_without_dir() {
+	local remove_dir=$1
+	local input_path=$2
+	local filtered=""
+	local part
+	IFS=: read -r -a parts <<<"$input_path"
+	for part in "${parts[@]}"; do
+		[[ -z $part || $part == "$remove_dir" ]] && continue
+		if [[ -z $filtered ]]; then
+			filtered=$part
+		else
+			filtered="$filtered:$part"
+		fi
+	done
+	echo "$filtered"
+}
+
+run_cmd() {
+	local out err rc
+	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$PATH_BASE" rm-safe "$@"
+	RM_OUT="$out"
+	RM_ERR="$err"
+	RM_RC="$rc"
+}
+
+run_cmd_no_tty() {
+	local out err rc
+	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$PATH_BASE" bash -c 'rm-safe "$@"' _ "$@" </dev/null
+	RM_OUT="$out"
+	RM_ERR="$err"
+	RM_RC="$rc"
+}
+
+run_cmd_expect() {
+	local path_override=$1
+	local cmd_args=$2
+	local out err rc
+	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$path_override" expect -c "
+		set timeout 5
+		spawn -noecho rm-safe $cmd_args
+		after 200
+		send \"\\r\"
+		expect eof
+		lassign [wait] pid spawnid os_error_flag rc
+		exit \$rc
+	"
+	RM_OUT="$out"
+	RM_ERR="$err"
+	RM_RC="$rc"
+}
+
+# Test 1: --undo restores last TRASH_MANUAL and logs TRASH_RESTORE
+reset_trash
+((tests++))
+echo "hello" >"$WORK_DIR/file1"
+run_cmd "$WORK_DIR/file1"
+if [[ $RM_RC -ne 0 ]]; then
+	echo "FAIL rm-safe failed to trash file" >&2
+	printf '%s\n' "$RM_ERR" >&2
+	((fails++))
+else
+	line=$(awk -F'\t' '$3=="TRASH_MANUAL"{line=$0} END{print line}' "$LOG_FILE")
+	if [[ -z $line ]]; then
+		echo "FAIL TRASH_MANUAL log entry missing" >&2
+		((fails++))
+	else
+		IFS=$'\t' read -r ts user action original trash_path details <<<"$line"
+		run_cmd --undo
+		if [[ $RM_RC -eq 0 && -e $original && ! -e $trash_path ]] && printf '%s' "$RM_ERR" | grep -F "Path $trash_path restored to $original successfully." >/dev/null; then
+			restore_line=$(tail -n 1 "$LOG_FILE")
+			IFS=$'\t' read -r rts ruser raction rsrc rdest rdetails <<<"$restore_line"
+			if [[ $raction == "TRASH_RESTORE" && $rsrc == "$trash_path" && $rdest == "$original" ]]; then
+				echo "OK --undo restores last TRASH_MANUAL"
+			else
+				echo "FAIL TRASH_RESTORE log entry incorrect" >&2
+				((fails++))
+			fi
+		else
+			echo "FAIL --undo did not restore file or message missing" >&2
+			printf '%s\n' "$RM_ERR" >&2
+			((fails++))
+		fi
+	fi
+fi
+
+# Test 2: --undo -2 restores the second-to-last TRASH_MANUAL
+reset_trash
+((tests++))
+echo "a" >"$WORK_DIR/fileA"
+echo "b" >"$WORK_DIR/fileB"
+run_cmd "$WORK_DIR/fileA"
+run_cmd "$WORK_DIR/fileB"
+run_cmd --undo -2
+if [[ $RM_RC -eq 0 && -e "$WORK_DIR/fileA" && ! -e "$WORK_DIR/fileB" ]]; then
+	echo "OK --undo -2 restores second-to-last entry"
+else
+	echo "FAIL --undo -2 did not restore expected file" >&2
+	printf '%s\n' "$RM_ERR" >&2
+	((fails++))
+fi
+
+# Test 3: --undo-picker falls back to --undo in non-interactive mode (with warning)
+reset_trash
+((tests++))
+echo "c" >"$WORK_DIR/fileC"
+run_cmd "$WORK_DIR/fileC"
+run_cmd_no_tty --undo-picker
+if [[ $RM_RC -eq 0 && -e "$WORK_DIR/fileC" ]] && printf '%s' "$RM_ERR" | grep -F "falling back to --undo" >/dev/null; then
+	echo "OK --undo-picker falls back to --undo when non-interactive"
+else
+	echo "FAIL --undo-picker fallback failed" >&2
+	printf '%s\n' "$RM_ERR" >&2
+	((fails++))
+fi
+
+# Test 4: --undo-picker uses gum in interactive mode
+reset_trash
+((tests++))
+if ! PATH="$PATH_BASE" command -v gum >/dev/null 2>&1; then
+	skip_test "--undo-picker gum" "gum not installed"
+else
+	echo "d" >"$WORK_DIR/fileD"
+	run_cmd "$WORK_DIR/fileD"
+	run_cmd_expect "$PATH_BASE" "--undo-picker"
+	if [[ $RM_RC -eq 0 && -e "$WORK_DIR/fileD" ]]; then
+		echo "OK --undo-picker restores via gum"
+	else
+		echo "FAIL --undo-picker gum restore failed" >&2
+		printf '%s\n' "$RM_OUT" >&2
+		printf '%s\n' "$RM_ERR" >&2
+		((fails++))
+	fi
+fi
+
+# Test 5: --undo-picker falls back to fzf when gum is missing
+reset_trash
+((tests++))
+fzf_path=$(PATH="$PATH_BASE" command -v fzf || true)
+gum_path=$(PATH="$PATH_BASE" command -v gum || true)
+if [[ -z $fzf_path ]]; then
+	skip_test "--undo-picker fzf" "fzf not installed"
+else
+	fzf_dir=$(dirname "$fzf_path")
+	gum_dir=""
+	[[ -n $gum_path ]] && gum_dir=$(dirname "$gum_path")
+	if [[ -n $gum_dir && $gum_dir == "$fzf_dir" ]]; then
+		skip_test "--undo-picker fzf" "gum and fzf share dir; cannot force fzf"
+	else
+		path_no_gum="$HOST_PATH"
+		[[ -n $gum_dir ]] && path_no_gum=$(path_without_dir "$gum_dir" "$HOST_PATH")
+		PATH_FZF="$BIN_DIR:$BASH_DIR:$REPO_ROOT/bin:$path_no_gum"
+		if ! PATH="$PATH_FZF" command -v fzf >/dev/null 2>&1; then
+			skip_test "--undo-picker fzf" "fzf not found after PATH filtering"
+		else
+			echo "e" >"$WORK_DIR/fileE"
+			run_cmd "$WORK_DIR/fileE"
+			run_cmd_expect "$PATH_FZF" "--undo-picker"
+			if [[ $RM_RC -eq 0 && -e "$WORK_DIR/fileE" ]] && printf '%s' "$RM_ERR" | grep -F "gum not found; trying fzf" >/dev/null; then
+				echo "OK --undo-picker restores via fzf"
+			else
+				echo "FAIL --undo-picker fzf restore failed" >&2
+				printf '%s\n' "$RM_ERR" >&2
+				((fails++))
+			fi
+		fi
+	fi
+fi
+
+echo "=== Test Summary ==="
+echo "Passed: $((tests - fails - skips))"
+echo "Skipped: $skips" >&2
+echo "Failed: $fails" >&2
+exit $fails

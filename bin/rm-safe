@@ -9,6 +9,7 @@ readonly SCRIPT_VERSION="4.0"
 readonly OS="$(uname)"
 readonly USER_ID="$EUID"
 readonly USER_NAME="$(id -un)"
+readonly PICKER_DELIM="__RM_SAFE_PICKER__"
 
 # Determine trash directory based on OS and user
 get_trash_base() {
@@ -88,6 +89,219 @@ log_action() {
 	printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
 		"$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
 		"$USER_NAME" "$action" "$path" "$trash_path" "$details" >> "$LOG_FILE"
+}
+
+# Check if running in an interactive terminal
+is_interactive_terminal() {
+	[[ -t 0 && -t 1 ]]
+}
+
+# Reverse log lines in a portable way
+reverse_log_lines() {
+	local log_path=$1
+
+	[[ -f $log_path ]] || return 1
+
+	if command -v tac >/dev/null 2>&1; then
+		tac -- "$log_path"
+		return 0
+	fi
+
+	if tail -r "$log_path" 2>/dev/null; then
+		return 0
+	fi
+
+	awk '{lines[NR]=$0} END {for (i=NR; i>=1; i--) print lines[i]}' "$log_path"
+}
+
+strip_ansi() {
+	local text=$1
+	printf '%s' "$text" | sed $'s/\x1B\\[[0-9;]*[[:alpha:]]//g'
+}
+
+manual_trash_action() {
+	if [[ ${TEST_MODE:-false} == true ]]; then
+		echo "TEST_TRASH_MANUAL"
+	else
+		echo "TRASH_MANUAL"
+	fi
+}
+
+parse_undo_offset() {
+	local offset_arg=${1:-}
+
+	if [[ -z $offset_arg ]]; then
+		echo 1
+		return 0
+	fi
+
+	if [[ $offset_arg =~ ^-[0-9]+$ ]]; then
+		local offset=${offset_arg#-}
+		if [[ $offset -ge 1 ]]; then
+			echo "$offset"
+			return 0
+		fi
+	fi
+
+	echo "rm-safe: Invalid undo offset: $offset_arg" >&2
+	return 1
+}
+
+get_trash_manual_entry() {
+	local offset=$1
+	local action_name=$2
+	local count=0
+	local line ts user action path trash_path details
+
+	while IFS= read -r line; do
+		IFS=$'\t' read -r ts user action path trash_path details <<<"$line"
+		if [[ $action == "$action_name" ]]; then
+			((count++))
+			if [[ $count -eq $offset ]]; then
+				echo "$line"
+				return 0
+			fi
+		fi
+	done < <(reverse_log_lines "$LOG_FILE")
+
+	return 1
+}
+
+restore_trash_entry() {
+	local trash_path=$1
+	local original_path=$2
+	local original_dir
+
+	if [[ -z $trash_path || -z $original_path ]]; then
+		echo "rm-safe: Error: Restore paths are empty" >&2
+		return 1
+	fi
+
+	if [[ ! -e $trash_path ]]; then
+		echo "rm-safe: Error: Trash path not found: $trash_path" >&2
+		return 1
+	fi
+
+	if [[ -e $original_path || -L $original_path ]]; then
+		echo "rm-safe: Error: Restore target already exists: $original_path" >&2
+		return 1
+	fi
+
+	original_dir=$(dirname -- "$original_path")
+	if [[ ! -d $original_dir ]]; then
+		mkdir -p -- "$original_dir" || {
+			echo "rm-safe: Error: Cannot create directory: $original_dir" >&2
+			return 1
+		}
+	fi
+
+	if mv -- "$trash_path" "$original_path"; then
+		local info_file="$TRASH_INFO_DIR/$(basename -- "$trash_path").trashinfo"
+		[[ -e $info_file ]] && command -p rm -f -- "$info_file"
+		log_action "TRASH_RESTORE" "$trash_path" "$original_path"
+		echo "Path $trash_path restored to $original_path successfully." >&2
+		return 0
+	fi
+
+	echo "rm-safe: Error: Failed to restore '$trash_path' to '$original_path'" >&2
+	return 1
+}
+
+undo_with_offset() {
+	local offset=${1:-1}
+	local action_name
+	local line ts user action original_path trash_path details
+
+	if [[ -z $LOG_FILE || ! -f $LOG_FILE ]]; then
+		echo "rm-safe: Error: Log file not available for undo" >&2
+		return 1
+	fi
+
+	action_name=$(manual_trash_action)
+	line=$(get_trash_manual_entry "$offset" "$action_name") || {
+		echo "rm-safe: Error: No $action_name entry found to undo" >&2
+		return 1
+	}
+
+	IFS=$'\t' read -r ts user action original_path trash_path details <<<"$line"
+	restore_trash_entry "$trash_path" "$original_path"
+}
+
+undo_picker() {
+	local offset_arg=${1:-}
+	local action_name line ts user action original_path trash_path details
+	local picker="gum"
+
+	if [[ -n $offset_arg ]]; then
+		undo_with_offset "$offset_arg"
+		return $?
+	fi
+
+	if ! is_interactive_terminal; then
+		echo "rm-safe: Warning: --undo-picker requires an interactive terminal; falling back to --undo" >&2
+		undo_with_offset 1
+		return $?
+	fi
+
+	if ! command -v gum >/dev/null 2>&1; then
+		echo "rm-safe: Warning: gum not found; trying fzf" >&2
+		if command -v fzf >/dev/null 2>&1; then
+			picker="fzf"
+		else
+			echo "rm-safe: Warning: fzf not found; cannot use --undo-picker" >&2
+			return 1
+		fi
+	fi
+
+	if [[ -z $LOG_FILE || ! -f $LOG_FILE ]]; then
+		echo "rm-safe: Error: Log file not available for undo" >&2
+		return 1
+	fi
+
+	action_name=$(manual_trash_action)
+	mapfile -t manual_lines < <(reverse_log_lines "$LOG_FILE" | awk -F'\t' -v action="$action_name" '$3==action')
+	if [[ ${#manual_lines[@]} -eq 0 ]]; then
+		echo "rm-safe: Error: No $action_name entries found to undo" >&2
+		return 1
+	fi
+
+	local menu=()
+	for i in "${!manual_lines[@]}"; do
+		IFS=$'\t' read -r ts user action original_path trash_path details <<<"${manual_lines[$i]}"
+		menu+=("[$((i + 1))] $ts  $original_path -> $trash_path${PICKER_DELIM}$((i + 1))")
+	done
+
+	local selection
+	if [[ $picker == "gum" ]]; then
+		selection=$(printf '%s\n' "${menu[@]}" | gum choose --label-delimiter "$PICKER_DELIM" --select-if-one) || return 1
+	else
+		selection=$(printf '%s\n' "${menu[@]}" | fzf --delimiter "$PICKER_DELIM" --with-nth 1 --select-1) || return 1
+	fi
+	if [[ -z $selection ]]; then
+		echo "rm-safe: Undo canceled" >&2
+		return 1
+	fi
+
+	local index="$selection"
+	if [[ $picker == "fzf" ]]; then
+		selection=$(strip_ansi "$selection")
+		selection=$(printf '%s' "$selection" | tr -d '\r')
+		selection="${selection##*${PICKER_DELIM}}"
+		index="$selection"
+	fi
+
+	index="${index#"${index%%[![:space:]]*}"}"
+	index="${index%"${index##*[![:space:]]}"}"
+
+	if [[ $index =~ ^[0-9]+$ ]]; then
+		line=${manual_lines[$((index - 1))]}
+	else
+		echo "rm-safe: Error: Unable to parse selection" >&2
+		return 1
+	fi
+
+	IFS=$'\t' read -r ts user action original_path trash_path details <<<"$line"
+	restore_trash_entry "$trash_path" "$original_path"
 }
 
 # Simplified path resolution
@@ -311,7 +525,10 @@ show_help() {
 	cat <<-EOF
 		rm-safe $SCRIPT_VERSION - Move files to trash instead of deleting
 
-		Usage: rm-safe [OPTIONS] FILE...
+		Usage:
+		  rm-safe [OPTIONS] FILE...
+		  rm-safe --undo [-N]
+		  rm-safe --undo-picker [-N]
 
 		Options:
 		  -f, --force        Override protection prompts
@@ -321,6 +538,12 @@ show_help() {
 		  -a, --about        Show a one-line description of this tool
 		  -h, --help         Show this help
 		  --test             Run integrated test suite
+		  --undo             Restore the most recent TRASH_MANUAL entry
+		  --undo-picker      Pick a TRASH_MANUAL entry to restore (uses gum or fzf)
+
+		Undo offsets:
+		  Pass a negative number like -2 to restore the 2nd most recent
+		  TRASH_MANUAL entry (so -1 is the default).
 
 		Trash location: $base_dir
 		  Files: $file_dir
@@ -384,6 +607,7 @@ show_help() {
 		  rm-safe -r directory/        # Recursively trash directory (atomic)
 		  rm-safe -i *.log            # Interactive removal
 		  rm-safe -vf /etc/config     # Force with verbose output
+		  rm-safe --undo              # Restore the most recent TRASH_MANUAL
 	EOF
 }
 
@@ -583,6 +807,8 @@ main() {
 		[recursive]=false
 		[verbose]=false
 	)
+	local undo_mode=""
+	local undo_offset_arg=""
 
 	# Parse options
 	while [[ $# -gt 0 ]]; do
@@ -593,6 +819,32 @@ main() {
 			-v|--verbose)     opts[verbose]=true ;;
 			-a|--about)       echo "rm-safe: A safer 'rm' that moves files to the system trash instead of permanently deleting them."; exit 0 ;;
 			-h|--help)        show_help; exit 0 ;;
+			--undo|--undo=*)
+				if [[ -n $undo_mode ]]; then
+					echo "rm-safe: Error: --undo and --undo-picker are mutually exclusive" >&2
+					exit 1
+				fi
+				undo_mode="undo"
+				if [[ $1 == --undo=* ]]; then
+					undo_offset_arg="${1#--undo=}"
+				elif [[ ${2:-} =~ ^-[0-9]+$ ]]; then
+					undo_offset_arg="$2"
+					shift
+				fi
+				;;
+			--undo-picker|--undo-picker=*)
+				if [[ -n $undo_mode ]]; then
+					echo "rm-safe: Error: --undo and --undo-picker are mutually exclusive" >&2
+					exit 1
+				fi
+				undo_mode="undo-picker"
+				if [[ $1 == --undo-picker=* ]]; then
+					undo_offset_arg="${1#--undo-picker=}"
+				elif [[ ${2:-} =~ ^-[0-9]+$ ]]; then
+					undo_offset_arg="$2"
+					shift
+				fi
+				;;
 			--test)
 				# Export options for test suite
 				export FORCE=${opts[force]}
@@ -625,6 +877,32 @@ main() {
 		esac
 		shift
 	done
+
+	if [[ -n $undo_mode ]]; then
+		if [[ $# -gt 0 ]]; then
+			echo "rm-safe: Error: undo options do not accept file operands" >&2
+			exit 1
+		fi
+
+		init
+
+		local offset=""
+		if [[ -n $undo_offset_arg ]]; then
+			offset=$(parse_undo_offset "$undo_offset_arg") || exit $?
+			if [[ $undo_mode == "undo-picker" && $offset -eq 1 ]]; then
+				offset=""
+			fi
+		fi
+
+		if [[ $undo_mode == "undo" ]]; then
+			offset=${offset:-1}
+			undo_with_offset "$offset"
+			exit $?
+		fi
+
+		undo_picker "$offset"
+		exit $?
+	fi
 
 	# Check for operands
 	if [[ $# -eq 0 ]]; then

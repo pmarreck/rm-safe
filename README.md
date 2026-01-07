@@ -7,11 +7,13 @@ Features
 - Moves files/directories to OS trash (XDG trash on Linux, Finder Trash on macOS).
 - Refuses to touch protected locations (`/`, `/etc`, `/nix/store`, etc.).
 - Works with sudo via a wrapper, not shell aliases.
+- Restores manual trash entries with `--undo` or `--undo-picker` (gum or fzf).
 - Built-in test suite: `bin/rm-safe --test`.
 
 Files
 - `bin/rm-safe` — main tool.
 - `bin/rm` — wrapper shim that routes `rm` -> `rm-safe`, warns/falls back to system `rm` safely (recursion guard).
+- `bin/test/rm-safe_test` — undo/restore tests.
 - `bin/test/rm_override_test` — shim tests.
 
 Quick start (user-level)
@@ -55,6 +57,7 @@ Cautions
 Testing
 - Shim: `bin/test/rm_override_test`
 - Main tool: `bin/rm-safe --test`
+- Undo/restore: `bin/test/rm-safe_test`
 
 License
 - MIT (see LICENSE)
