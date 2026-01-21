@@ -16,3 +16,4 @@ aren’t installed. Done means:
 - [x] Run `bin/test/rm_override_test` and fix issues
 - [x] Vendor `capture.bash` into repo and update tests to use local copy
 - [x] Update `CODE_MINIMAP.md`
+- [x] Clarify README sudo behavior differences across macOS and Linux

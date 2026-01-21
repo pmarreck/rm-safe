@@ -22,6 +22,10 @@ Quick start (user-level)
 3. Run `bin/rm-safe --help` and `bin/test/rm_override_test`.
 
 Platform notes
+Why sudo setup differs by OS:
+- macOS `sudo` preserves the user `PATH` by default, so a user-level shim earlier in `PATH` (e.g., `~/bin/rm`) will still be found under sudo.
+- Most Linux distros set `secure_path` in sudoers, which **replaces** the user `PATH` with a fixed, root-owned path for safety. That means user-level shims are ignored unless you place a root-owned shim in the secure path.
+
 macOS (defaults keep user PATH under sudo)
 - Symlink or copy `bin/rm` into `~/bin` (or any user directory already ahead of `/bin`).
 - `sudo rm …` will hit the shim because PATH is preserved by default.
