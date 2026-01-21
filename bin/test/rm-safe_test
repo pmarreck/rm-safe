@@ -4,9 +4,8 @@ fails=0
 tests=0
 skips=0
 
-. "$HOME/dotfiles/bin/src/capture.bash"
-
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+. "$REPO_ROOT/bin/test/capture.bash"
 TEST_DIR=$(mktemp -d --tmpdir rm-safe-test.XXXXXX)
 trap 'command -p rm -rf "$TEST_DIR"' EXIT
 

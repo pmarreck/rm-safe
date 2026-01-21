@@ -14,3 +14,5 @@ aren’t installed. Done means:
 - [x] Implement undo-picker dependency handling and help/README updates
 - [x] Run `bin/test/rm-safe_test` and fix issues
 - [x] Run `bin/test/rm_override_test` and fix issues
+- [x] Vendor `capture.bash` into repo and update tests to use local copy
+- [x] Update `CODE_MINIMAP.md`
