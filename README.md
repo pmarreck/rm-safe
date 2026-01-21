@@ -27,7 +27,7 @@ Why sudo setup differs by OS:
 - Most Linux distros set `secure_path` in sudoers, which **replaces** the user `PATH` with a fixed, root-owned path for safety. That means user-level shims are ignored unless you place a root-owned shim in the secure path.
 
 macOS (defaults keep user PATH under sudo)
-- Symlink or copy `bin/rm` into `~/bin` (or any user directory already ahead of `/bin`).
+- Symlink or copy `bin/rm` into `~/bin` (or any user directory already ahead of `/bin` on PATH).
 - `sudo rm …` will hit the shim because PATH is preserved by default.
 
 Linux with sudo `secure_path`
