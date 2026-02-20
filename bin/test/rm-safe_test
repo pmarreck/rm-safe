@@ -55,14 +55,22 @@ skip_test() {
 	((skips++))
 }
 
-path_without_dir() {
-	local remove_dir=$1
-	local input_path=$2
+path_without_commands() {
+	local input_path=$1
+	shift
 	local filtered=""
-	local part
+	local part cmd skip_part
 	IFS=: read -r -a parts <<<"$input_path"
 	for part in "${parts[@]}"; do
-		[[ -z $part || $part == "$remove_dir" ]] && continue
+		[[ -z $part ]] && continue
+		skip_part=false
+		for cmd in "$@"; do
+			if [[ -x $part/$cmd ]]; then
+				skip_part=true
+				break
+			fi
+		done
+		[[ $skip_part == true ]] && continue
 		if [[ -z $filtered ]]; then
 			filtered=$part
 		else
@@ -70,6 +78,27 @@ path_without_dir() {
 		fi
 	done
 	echo "$filtered"
+}
+
+build_path_with_fzf_only() {
+	local fzf_source=$1
+	local overlay_dir="$TEST_DIR/path-overlay"
+	local cmd cmd_path
+	mkdir -p "$overlay_dir"
+
+	# Use symlinks only; never copy binaries into the overlay PATH.
+	ln -sf -- "$fzf_source" "$overlay_dir/fzf"
+	for cmd in bash luajit expect; do
+		cmd_path=$(PATH="$PATH_BASE" command -v "$cmd" || true)
+		[[ -n $cmd_path ]] && ln -sf -- "$cmd_path" "$overlay_dir/$cmd"
+	done
+	if [[ ! -L $overlay_dir/fzf ]]; then
+		return 1
+	fi
+
+	local host_filtered
+	host_filtered=$(path_without_commands "$HOST_PATH" gum fzf)
+	echo "$overlay_dir:$BIN_DIR:$REPO_ROOT/bin:$host_filtered"
 }
 
 run_cmd() {
@@ -193,32 +222,31 @@ fi
 reset_trash
 ((tests++))
 fzf_path=$(PATH="$PATH_BASE" command -v fzf || true)
-gum_path=$(PATH="$PATH_BASE" command -v gum || true)
 if [[ -z $fzf_path ]]; then
 	skip_test "--undo-picker fzf" "fzf not installed"
 else
-	fzf_dir=$(dirname "$fzf_path")
-	gum_dir=""
-	[[ -n $gum_path ]] && gum_dir=$(dirname "$gum_path")
-	if [[ -n $gum_dir && $gum_dir == "$fzf_dir" ]]; then
-		skip_test "--undo-picker fzf" "gum and fzf share dir; cannot force fzf"
+	if ! PATH_FZF=$(build_path_with_fzf_only "$fzf_path"); then
+		echo "FAIL --undo-picker fzf setup failed: overlay path build failed" >&2
+		((fails++))
+	elif [[ ! -L "$TEST_DIR/path-overlay/fzf" ]]; then
+		echo "FAIL --undo-picker fzf setup failed: fzf overlay entry is not a symlink" >&2
+		((fails++))
+	elif PATH="$PATH_FZF" command -v gum >/dev/null 2>&1; then
+		echo "FAIL --undo-picker fzf setup failed: gum still visible in PATH" >&2
+		((fails++))
+	elif ! PATH="$PATH_FZF" command -v fzf >/dev/null 2>&1; then
+		echo "FAIL --undo-picker fzf setup failed: fzf missing from PATH overlay" >&2
+		((fails++))
 	else
-		path_no_gum="$HOST_PATH"
-		[[ -n $gum_dir ]] && path_no_gum=$(path_without_dir "$gum_dir" "$HOST_PATH")
-		PATH_FZF="$BIN_DIR:$BASH_DIR:$REPO_ROOT/bin:$path_no_gum"
-		if ! PATH="$PATH_FZF" command -v fzf >/dev/null 2>&1; then
-			skip_test "--undo-picker fzf" "fzf not found after PATH filtering"
+		echo "e" >"$WORK_DIR/fileE"
+		run_cmd "$WORK_DIR/fileE"
+		run_cmd_expect "$PATH_FZF" "--undo-picker"
+		if [[ $RM_RC -eq 0 && -e "$WORK_DIR/fileE" ]] && printf '%s\n%s' "$RM_ERR" "$RM_OUT" | grep -F "gum not found; trying fzf" >/dev/null; then
+			echo "OK --undo-picker restores via fzf"
 		else
-			echo "e" >"$WORK_DIR/fileE"
-			run_cmd "$WORK_DIR/fileE"
-			run_cmd_expect "$PATH_FZF" "--undo-picker"
-			if [[ $RM_RC -eq 0 && -e "$WORK_DIR/fileE" ]] && printf '%s' "$RM_ERR" | grep -F "gum not found; trying fzf" >/dev/null; then
-				echo "OK --undo-picker restores via fzf"
-			else
-				echo "FAIL --undo-picker fzf restore failed" >&2
-				printf '%s\n' "$RM_ERR" >&2
-				((fails++))
-			fi
+			echo "FAIL --undo-picker fzf restore failed" >&2
+			printf '%s\n' "$RM_ERR" >&2
+			((fails++))
 		fi
 	fi
 fi
