@@ -54,6 +54,41 @@ NixOS (declarative)
   ```
 - Ensure `rm` wrapper in that path execs `rm-safe`; shim already uses `command -p rm` to reach the real rm when needed.
 
+Claude Code / AI agent integration
+- Tools like `nix develop` prepend `/nix/store/.../bin` to `PATH`, shadowing user-level `rm` shims with GNU `rm`. AI coding agents (Claude Code, Codex, etc.) run shell commands through these environments and can permanently delete files without realizing the safe wrapper is bypassed.
+- To prevent this in Claude Code, add a global `PreToolUse` hook that blocks bare `rm` in Bash calls:
+
+  **1. Create `~/.claude/hooks/block-rm/block-rm.sh`:**
+  ```bash
+  #!/bin/bash
+  set -u
+  COMMAND=$(jq -r '.tool_input.command')
+  if echo "$COMMAND" | grep -qE '\brm\b' && ! echo "$COMMAND" | grep -qE 'rm-safe'; then
+    echo "BLOCKED: Use rm-safe instead of rm." >&2
+    exit 2
+  fi
+  exit 0
+  ```
+  ```
+  chmod +x ~/.claude/hooks/block-rm/block-rm.sh
+  ```
+
+  **2. Add to `~/.claude/settings.json` under `hooks.PreToolUse`:**
+  ```json
+  {
+    "matcher": "Bash",
+    "hooks": [
+      {
+        "type": "command",
+        "command": "~/.claude/hooks/block-rm/block-rm.sh",
+        "timeout": 2
+      }
+    ]
+  }
+  ```
+
+  Any Bash tool call containing `rm` (but not `rm-safe`) will be rejected before execution. The agent sees the block message and retries with `rm-safe`.
+
 Cautions
 - Log-rotate/cleanup scripts that expect permanent deletion will move files to trash when the shim is first in PATH; they should call `/bin/rm` explicitly if deletion is intended.
 - The shim warns to stderr if `rm-safe` is missing and falls back to system `rm`.
