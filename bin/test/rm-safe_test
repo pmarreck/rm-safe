@@ -108,6 +108,17 @@ build_path_with_fzf_only() {
 		cmd_path=$(PATH="$PATH_BASE" command -v "$cmd" || true)
 		[[ -n $cmd_path ]] && ln -sf -- "$cmd_path" "$overlay_dir/$cmd"
 	done
+	# Ensure core POSIX tools resolve to real system binaries, not any ~/bin wrapper
+	# scripts that shadow them (e.g. ~/bin/date, ~/bin/tac).  Search known safe
+	# locations in priority order; skip if none found.
+	for cmd in date awk sed; do
+		for sys_dir in /bin /usr/bin; do
+			if [[ -x "$sys_dir/$cmd" ]]; then
+				ln -sf -- "$sys_dir/$cmd" "$overlay_dir/$cmd"
+				break
+			fi
+		done
+	done
 	if [[ ! -L $overlay_dir/fzf ]]; then
 		return 1
 	fi
