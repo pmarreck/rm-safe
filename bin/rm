@@ -1,31 +1,47 @@
 #!/usr/bin/env bash
 
-# rm override shim: routes to rm-safe when available; falls back to system rm
+# rm override shim: routes to the luajit rm-safe (fast) or rm-safe.bash
+# (universal), honoring an explicit RM_SAFE_BIN override; falls back to system rm.
 
-SAFE_RM=$(command -v rm-safe 2>/dev/null || true)
 REAL_RM=${REAL_RM:-/bin/rm}
 SELF_PATH=${BASH_SOURCE[0]:-$0}
+HERE=$(cd "$(dirname "$SELF_PATH")" 2>/dev/null && pwd || echo "")
 
-# Avoid recursion: if rm-safe or REAL_RM point to this shim, ignore them
-if [[ -n "$SAFE_RM" ]] && [[ "$SAFE_RM" == "$SELF_PATH" || "$SAFE_RM" == "$REAL_RM" ]]; then
+# Warn unless RM_SAFE_QUIET is truthy.
+quiet=false
+case "${RM_SAFE_QUIET:-}" in 1|true|yes|on) quiet=true ;; esac
+warn() { [[ $quiet == true ]] || echo "rm override: $*" >&2; }
+
+# 1. Explicit override wins; never warns (user chose it).
+if [[ -n ${RM_SAFE_BIN:-} ]]; then
+	if [[ -x $RM_SAFE_BIN ]]; then
+		exec "$RM_SAFE_BIN" "$@"
+	fi
+	echo "rm override: RM_SAFE_BIN=$RM_SAFE_BIN is not executable; ignoring" >&2
+fi
+
+# 2. luajit fast path: a real rm-safe on PATH AND a luajit interpreter present.
+SAFE_RM=$(command -v rm-safe 2>/dev/null || true)
+if [[ -n $SAFE_RM ]] && { [[ $SAFE_RM == "$SELF_PATH" ]] || [[ $SAFE_RM == "$REAL_RM" ]]; }; then
 	echo "rm override: detected recursive SAFE_RM; ignoring" >&2
 	SAFE_RM=""
 fi
-
-if [[ -n "$REAL_RM" ]] && [[ "$REAL_RM" == "$SELF_PATH" ]]; then
-	echo "rm override: detected recursive REAL_RM; falling back to system rm" >&2
-	REAL_RM=""
-fi
-
-if [[ -x "$SAFE_RM" ]]; then
+if [[ -x $SAFE_RM ]] && command -v luajit >/dev/null 2>&1; then
 	exec "$SAFE_RM" "$@"
 fi
 
-# Warn once per invocation when rm-safe is missing
-echo "rm override: rm-safe not found in PATH; using system rm" >&2
+# 3. Universal bash implementation (sibling of this shim).
+BASH_IMPL="$HERE/rm-safe.bash"
+if [[ -x $BASH_IMPL ]]; then
+	if ! command -v luajit >/dev/null 2>&1; then
+		warn "luajit not found; using slower bash implementation (set RM_SAFE_QUIET=1 to silence)"
+	fi
+	exec "$BASH_IMPL" "$@"
+fi
 
-# Prefer provided REAL_RM, else fallback to known locations, else command -p rm
-if [[ -n "$REAL_RM" && -x "$REAL_RM" ]]; then
+# 4. Last resort: system rm.
+echo "rm override: rm-safe not found in PATH; using system rm" >&2
+if [[ -n $REAL_RM && -x $REAL_RM && $REAL_RM != "$SELF_PATH" ]]; then
 	exec "$REAL_RM" "$@"
 elif [[ -x /usr/bin/rm ]]; then
 	exec /usr/bin/rm "$@"

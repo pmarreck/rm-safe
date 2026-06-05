@@ -12,6 +12,24 @@ SELF="$RM_SHIM"
 test_dir=$(mktemp -d --tmpdir rm-override-test.XXXXXX)
 trap 'rm -rf "$test_dir"' EXIT
 
+# PATH must still contain bash/dirname/etc for the shim's shebang; avoid rm-safe presence
+PATH_SAFE="/usr/local/bin:/usr/bin:/bin"
+[[ -d /run/current-system/sw/bin ]] && PATH_SAFE="/run/current-system/sw/bin:$PATH_SAFE"
+
+# A bin dir with a FAKE luajit, so the shim's luajit fast-path fires regardless
+# of whether this machine actually has luajit installed.
+LUAJIT_STUB_DIR="$test_dir/with_luajit"
+mkdir -p "$LUAJIT_STUB_DIR"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$LUAJIT_STUB_DIR/luajit"
+chmod +x "$LUAJIT_STUB_DIR/luajit"
+
+# A PATH guaranteed to have no luajit: filter out any PATH_SAFE dir that contains luajit.
+NO_LUAJIT_PATH=""
+IFS=: read -ra _dirs <<< "$PATH_SAFE"
+for _d in "${_dirs[@]}"; do
+	[[ -x "$_d/luajit" ]] || NO_LUAJIT_PATH="${NO_LUAJIT_PATH:+$NO_LUAJIT_PATH:}$_d"
+done
+
 # helper: run command, capture stdout/stderr, exit status
 run_cmd() {
 	local cmd="$1"; shift
@@ -29,7 +47,7 @@ echo "rm-safe invoked" >"$TMPDIR/rm-safe-called"
 EOF
 chmod +x "$rm_safe_fake"
 
-TMPDIR="$test_dir" PATH="$test_dir:$PATH" REAL_RM="/bin/rm" bash -c "$RM_SHIM >/dev/null" 2>/dev/null
+TMPDIR="$test_dir" PATH="$test_dir:$LUAJIT_STUB_DIR:$PATH_SAFE" REAL_RM="/bin/rm" bash -c "$RM_SHIM >/dev/null" 2>/dev/null
 
 if [[ -f "$test_dir/rm-safe-called" ]]; then
 	echo "✓ rm-safe invoked when available"
@@ -38,22 +56,24 @@ else
 	((fails++))
 fi
 
-# Test 2: Falls back and warns when rm-safe missing
+# Test 2: Falls back and warns when rm-safe AND rm-safe.bash are both missing
+# Use a shim copy isolated in its own dir (no bash impl sibling), so we hit
+# the final REAL_RM fallback with "rm-safe not found" warning.
 ((tests++))
+shim2_dir="$test_dir/shim2"
+mkdir -p "$shim2_dir"
 real_rm_fake="$test_dir/real-rm"
 cat >"$real_rm_fake" <<'EOF'
 #!/usr/bin/env bash
 echo "real rm used" >"$TMPDIR/real-rm-called"
 EOF
 chmod +x "$real_rm_fake"
+cp "$RM_SHIM" "$shim2_dir/rm"
+chmod +x "$shim2_dir/rm"
 
 mkdir -p "$test_dir/empty"
 
-# PATH must still contain bash for the shim's shebang; avoid rm-safe presence
-PATH_SAFE="/usr/local/bin:/usr/bin:/bin"
-[[ -d /run/current-system/sw/bin ]] && PATH_SAFE="/run/current-system/sw/bin:$PATH_SAFE"
-PATH="$test_dir/empty:$PATH_SAFE"
-TMPDIR="$test_dir" REAL_RM="$real_rm_fake" "$RM_SHIM" >/dev/null 2>"$test_dir/stderr.txt"
+TMPDIR="$test_dir" REAL_RM="$real_rm_fake" PATH="$test_dir/empty:$PATH_SAFE" "$shim2_dir/rm" >/dev/null 2>"$test_dir/stderr.txt"
 
 if [[ -f "$test_dir/real-rm-called" ]]; then
 	echo "✓ Fallback rm invoked when rm-safe missing"
@@ -69,15 +89,67 @@ else
 	((fails++))
 fi
 
-# Test 3: Guard against recursion when SAFE_RM/REAL_RM point to shim
+# Test 3: Guard against recursion when rm-safe on PATH points to this shim
+# Put a symlink named "rm-safe" pointing to the shim itself into a test dir;
+# the shim should detect the loop and warn.
 ((tests++))
-PATH="$test_dir/empty:$PATH_SAFE"
-TMPDIR="$test_dir" SAFE_RM="$SELF" REAL_RM="$SELF" "$RM_SHIM" >/dev/null 2>"$test_dir/stderr2.txt" || true
+recur_dir="$test_dir/recur"
+mkdir -p "$recur_dir"
+cp "$RM_SHIM" "$recur_dir/rm"
+chmod +x "$recur_dir/rm"
+# rm-safe on PATH resolves to the same file as this shim copy → recursion guard fires.
+ln -sf "$recur_dir/rm" "$recur_dir/rm-safe"
+TMPDIR="$test_dir" REAL_RM="$real_rm_fake" PATH="$recur_dir:$LUAJIT_STUB_DIR:$PATH_SAFE" "$recur_dir/rm" >/dev/null 2>"$test_dir/stderr2.txt" || true
 
 if grep -q "recursive" "$test_dir/stderr2.txt"; then
 	echo "✓ Recursion detected and warned"
 else
 	echo "✗ Recursion guard did not warn" >&2
+	((fails++))
+fi
+
+# Test 4: RM_SAFE_BIN override takes precedence
+((tests++))
+override_fake="$test_dir/override-impl"
+cat >"$override_fake" <<'EOF'
+#!/usr/bin/env bash
+echo "override invoked" >"$TMPDIR/override-called"
+EOF
+chmod +x "$override_fake"
+TMPDIR="$test_dir" PATH="$test_dir:$PATH_SAFE" RM_SAFE_BIN="$override_fake" "$RM_SHIM" >/dev/null 2>&1
+if [[ -f "$test_dir/override-called" ]]; then
+	echo "✓ RM_SAFE_BIN override is honored"
+else
+	echo "✗ RM_SAFE_BIN override not honored" >&2
+	((fails++))
+fi
+
+# Test 5: luajit absent -> bash impl used + warning; RM_SAFE_QUIET silences it
+((tests++))
+bash_impl_fake="$test_dir/rm-safe.bash"
+cat >"$bash_impl_fake" <<'EOF'
+#!/usr/bin/env bash
+echo "bash impl invoked" >"$TMPDIR/bash-impl-called"
+EOF
+chmod +x "$bash_impl_fake"
+# Shim resolves its sibling rm-safe.bash relative to its own dir, so point a
+# copy of the shim next to the fake bash impl, with NO luajit on PATH.
+cp "$RM_SHIM" "$test_dir/rm"
+chmod +x "$test_dir/rm"
+mkdir -p "$test_dir/empty"
+TMPDIR="$test_dir" PATH="$test_dir/empty:$NO_LUAJIT_PATH" "$test_dir/rm" foo >/dev/null 2>"$test_dir/warn.txt"
+if [[ -f "$test_dir/bash-impl-called" ]] && grep -q "luajit not found" "$test_dir/warn.txt"; then
+	echo "✓ Falls back to bash impl with warning when luajit absent"
+else
+	echo "✗ bash fallback/warning failed" >&2
+	((fails++))
+fi
+rm -f "$test_dir/bash-impl-called"
+TMPDIR="$test_dir" RM_SAFE_QUIET=1 PATH="$test_dir/empty:$NO_LUAJIT_PATH" "$test_dir/rm" foo >/dev/null 2>"$test_dir/warn2.txt"
+if [[ -f "$test_dir/bash-impl-called" ]] && ! grep -q "luajit not found" "$test_dir/warn2.txt"; then
+	echo "✓ RM_SAFE_QUIET suppresses the warning"
+else
+	echo "✗ RM_SAFE_QUIET did not suppress warning" >&2
 	((fails++))
 fi
 
