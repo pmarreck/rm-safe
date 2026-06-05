@@ -104,8 +104,11 @@ detect_capabilities() {
 		HAS_TAC=true
 	elif command -v tac >/dev/null 2>&1; then
 		# Smoke-test tac: if it hangs on empty input, skip it.
+		# The 3>&- 4>&- close any test-harness FDs so an orphaned tac subprocess
+		# (e.g. a wrapper script that ignores SIGTERM) cannot hold capture's pipes
+		# open and cause a deadlock in the test suite.
 		if command -v timeout >/dev/null 2>&1; then
-			if printf \'\' | timeout 2 tac >/dev/null 2>&1; then
+			if printf \'\' | timeout 2 tac 3>&- 4>&- >/dev/null 2>&1; then
 				_TAC_CMD=tac
 				HAS_TAC=true
 			fi
@@ -334,6 +337,7 @@ undo_picker() {
 	local offset_arg=${1:-}
 	local action_name line ts user action original_path trash_path details
 	local picker="gum"
+	local manual_lines
 
 	if [[ -n $offset_arg ]]; then
 		undo_with_offset "$offset_arg"
@@ -362,7 +366,13 @@ undo_picker() {
 	fi
 
 	action_name=$(manual_trash_action)
-	mapfile -t manual_lines < <(reverse_log_lines "$LOG_FILE" | awk -F'\t' -v action="$action_name" '$3==action')
+	manual_lines=()
+	if [[ $BASH4 -eq 1 ]]; then
+		mapfile -t manual_lines < <(reverse_log_lines "$LOG_FILE" | awk -F'\t' -v action="$action_name" '$3==action')
+	else
+		while IFS= read -r __line; do manual_lines+=("$__line"); done \
+			< <(reverse_log_lines "$LOG_FILE" 3>&- 4>&- | awk -F'\t' -v action="$action_name" '$3==action' 3>&- 4>&-)
+	fi
 	if [[ ${#manual_lines[@]} -eq 0 ]]; then
 		echo "rm-safe: Error: No $action_name entries found to undo" >&2
 		return 1

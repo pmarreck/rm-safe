@@ -142,8 +142,11 @@ run_cmd_expect() {
 		spawn -noecho rm-safe $cmd_args
 		after 200
 		send \"\\r\"
-		expect eof
-		lassign [wait] pid spawnid os_error_flag rc
+		set rc 1
+		expect {
+			eof { catch {lassign [wait] _p _s _e rc} }
+			timeout { catch {exec kill -9 [exp_pid]}; catch {wait}; set rc 124 }
+		}
 		exit \$rc
 	"
 	RM_OUT="$out"
