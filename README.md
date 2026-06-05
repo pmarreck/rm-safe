@@ -10,16 +10,40 @@ Features
 - Restores manual trash entries with `--undo` or `--undo-picker` (gum or fzf).
 - Built-in test suite: `bin/rm-safe --test`.
 
+## Quick install (no dependencies)
+
+rm-safe runs on a stock macOS or Linux box with nothing to install:
+
+```sh
+git clone https://github.com/pmarreck/rm-safe.git rm-safe
+# put the shim + universal bash implementation on your PATH
+ln -s "$PWD/rm-safe/bin/rm"           ~/.local/bin/rm
+ln -s "$PWD/rm-safe/bin/rm-safe.bash" ~/.local/bin/rm-safe.bash
+```
+
+That's the whole install. `rm` now moves files to the trash instead of deleting
+them. It works on the bash that ships with macOS (3.2) and on Linux.
+
+### Optional upgrades
+
+- **Speed:** install **luajit** (with LuaFileSystem) and the shim automatically
+  uses the faster `bin/rm-safe`. Without luajit you'll see a one-time note
+  (silence it with `RM_SAFE_QUIET=1`).
+- **Nix:** `nix develop` for a managed dev/test environment, or
+  `nix build .#rm-safe` / `.#rm-safe-bash` for packaged builds.
+
+### Choosing an implementation
+
+Set `RM_SAFE_BIN=/path/to/rm-safe.bash` (or the luajit `bin/rm-safe`) to force a
+specific implementation for both `rm` and the tests.
+
 Files
-- `bin/rm-safe` — main tool.
-- `bin/rm` — wrapper shim that routes `rm` -> `rm-safe`, warns/falls back to system `rm` safely (recursion guard).
+- `bin/rm-safe.bash` — universal bash implementation; works on macOS bash 3.2 and Linux with no extra dependencies.
+- `bin/rm-safe` — faster LuaJIT implementation; used automatically when luajit+lfs is available.
+- `bin/rm` — wrapper shim: dispatches `RM_SAFE_BIN` override → luajit → bash fallback → system rm; warns (suppressible via `RM_SAFE_QUIET=1`) when falling back.
 - `bin/test/rm-safe_test` — undo/restore tests.
 - `bin/test/rm_override_test` — shim tests.
-
-Quick start (user-level)
-1. Put `bin` on your `PATH` (e.g., `export PATH="$PWD/bin:$PATH"`).
-2. Optional: remove any `alias rm=…` so the shim is used directly.
-3. Run `bin/rm-safe --help` and `bin/test/rm_override_test`.
+- `bin/test/run-all` — runs the full test suite across luajit / bash-4+ / bash-3.2 lanes.
 
 Platform notes
 Why sudo setup differs by OS:
@@ -94,6 +118,7 @@ Cautions
 - The shim warns to stderr if `rm-safe` is missing and falls back to system `rm`.
 
 Testing
+- Run all lanes (luajit / bash-4+ / bash-3.2): `bin/test/run-all`
 - Shim: `bin/test/rm_override_test`
 - Main tool: `bin/rm-safe --test`
 - Undo/restore: `bin/test/rm-safe_test`
