@@ -35,6 +35,7 @@ TRASH_FILES_DIR=""
 TRASH_INFO_DIR=""
 LOG_FILE=""
 HAS_TAC=false
+_TAC_CMD=""
 HAS_GUM=false
 HAS_FZF=false
 HAS_REALPATH=false
@@ -65,6 +66,7 @@ readonly -a EXACT_PROTECTED=(
 # --- Init ---
 detect_capabilities() {
 	HAS_TAC=false
+	_TAC_CMD=""
 	HAS_GUM=false
 	HAS_FZF=false
 	HAS_REALPATH=false
@@ -74,7 +76,25 @@ detect_capabilities() {
 	HAS_TRASHPUT=false
 	HAS_PRINTF_TIME=false
 
-	command -v tac >/dev/null 2>&1 && HAS_TAC=true
+	# Prefer gtac (GNU coreutils on macOS); fall back to tac only if it actually works.
+	# A bare "command -v tac" check is insufficient: some PATH entries ship a wrapper
+	# script that silently loops when gtac is absent, causing an infinite hang.
+	if command -v gtac >/dev/null 2>&1; then
+		_TAC_CMD=gtac
+		HAS_TAC=true
+	elif command -v tac >/dev/null 2>&1; then
+		# Smoke-test tac: if it hangs on empty input, skip it.
+		if command -v timeout >/dev/null 2>&1; then
+			if printf \'\' | timeout 2 tac >/dev/null 2>&1; then
+				_TAC_CMD=tac
+				HAS_TAC=true
+			fi
+		else
+			# No timeout available — trust that tac is the real implementation.
+			_TAC_CMD=tac
+			HAS_TAC=true
+		fi
+	fi
 	command -v gum >/dev/null 2>&1 && HAS_GUM=true
 	command -v fzf >/dev/null 2>&1 && HAS_FZF=true
 	command -v realpath >/dev/null 2>&1 && HAS_REALPATH=true
@@ -161,7 +181,7 @@ reverse_log_lines() {
 	[[ -f $log_path ]] || return 1
 
 	if [[ $HAS_TAC == true ]]; then
-		tac -- "$log_path"
+		"${_TAC_CMD:-tac}" -- "$log_path"
 		return 0
 	fi
 
@@ -334,12 +354,24 @@ undo_picker() {
 		menu+=("[$((i + 1))] $ts  $original_path -> $trash_path${PICKER_DELIM}$((i + 1))")
 	done
 
-	local selection
+	local selection __pick_dir __pick_in __pick_out __pick_rc
+	# Use a private mktemp dir (not a predictable /tmp/...$$ path) so the picker
+	# output file can't be pre-created/symlinked by another local user.
+	__pick_dir=$(mktemp -d "${TMPDIR:-/tmp}/rm-safe-pick.XXXXXX") || return 1
+	__pick_in="$__pick_dir/in"
+	__pick_out="$__pick_dir/out"
+	printf '%s\n' "${menu[@]}" >"$__pick_in"
+	local __pick_cmd
 	if [[ $picker == "gum" ]]; then
-		selection=$(printf '%s\n' "${menu[@]}" | gum choose --label-delimiter "$PICKER_DELIM" --select-if-one) || return 1
+		__pick_cmd="gum choose --label-delimiter $(printf '%q' "$PICKER_DELIM") --select-if-one"
 	else
-		selection=$(printf '%s\n' "${menu[@]}" | fzf --delimiter "$PICKER_DELIM" --with-nth 1 --select-1) || return 1
+		__pick_cmd="fzf --delimiter $(printf '%q' "$PICKER_DELIM") --with-nth 1 --select-1"
 	fi
+	/bin/sh -c "$__pick_cmd" <"$__pick_in" >"$__pick_out"
+	__pick_rc=$?
+	{ IFS= read -r selection <"$__pick_out"; } 2>/dev/null || selection=""
+	/bin/rm -rf "$__pick_dir"
+	[[ $__pick_rc -eq 0 ]] || return 1
 	if [[ -z $selection ]]; then
 		echo "rm-safe: Undo canceled" >&2
 		return 1

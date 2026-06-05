@@ -17,6 +17,11 @@ WANT_LANE="${1:-}"; [[ $WANT_LANE == --lane ]] && WANT_LANE="${2:-}"
 WRAP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rm-safe-lanes.XXXXXX")
 trap '/bin/rm -rf "$WRAP_DIR"' EXIT
 
+# Hang guard: wrap suite runs in a timeout if one is available (coreutils
+# `timeout`/`gtimeout`). Stock macOS lacks it; then we run unguarded.
+TIMEOUT_CMD=""
+for t in timeout gtimeout; do if command -v "$t" >/dev/null 2>&1; then TIMEOUT_CMD="$t 180"; break; fi; done
+
 # Find a bash whose major version matches $1 (4 means ">=4"). Echo its path or "".
 find_bash() {
 	local want=$1 c ver major
@@ -49,7 +54,7 @@ run_lane() { # $1 = lane name, $2 = RM_SAFE_BIN wrapper
 	echo
 	echo "########## LANE: $name  ($bin) ##########"
 	lanes_run+=1
-	if ! RM_SAFE_BIN="$bin" "$SUITE"; then
+	if ! RM_SAFE_BIN="$bin" $TIMEOUT_CMD "$SUITE"; then
 		lanes_failed+=1
 		echo ">>> LANE $name FAILED" >&2
 	fi
@@ -88,7 +93,7 @@ fi
 if [[ -z $WANT_LANE ]]; then
 	echo; echo "########## rm_override_test (shim) ##########"
 	lanes_run+=1
-	if ! "$OVERRIDE_SUITE"; then lanes_failed+=1; echo ">>> shim tests FAILED" >&2; fi
+	if ! $TIMEOUT_CMD "$OVERRIDE_SUITE"; then lanes_failed+=1; echo ">>> shim tests FAILED" >&2; fi
 fi
 
 echo
