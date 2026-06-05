@@ -39,6 +39,23 @@ if [[ $BASH4 -eq 0 && $__rm_safe_quiet == false ]]; then
 		"${BASH_VERSION%%(*}" >&2
 fi
 
+# --- GNU tool preference ---------------------------------------------------
+# Prefer g-prefixed GNU tools (macOS coreutils-prefixed) when present, else the
+# plain binary. Keeps GNU intent explicit; plain names are used on Linux/BSD.
+_resolve_tool() { # $1 = g-name, $2 = plain name -> echoes a usable command name
+	if command -v "$1" >/dev/null 2>&1; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
+GMKTEMP=$(_resolve_tool gmktemp mktemp)
+GMV=$(_resolve_tool gmv mv)
+GMKDIR=$(_resolve_tool gmkdir mkdir)
+
+# mktemp -d: GNU accepts --tmpdir; BSD needs a full template path. Probe once.
+if "$GMKTEMP" --version >/dev/null 2>&1; then
+	_mktemp_dir() { "$GMKTEMP" -d --tmpdir "${1:-tmp}.XXXXXX"; }   # GNU
+else
+	_mktemp_dir() { "$GMKTEMP" -d "${TMPDIR:-/tmp}/${1:-tmp}.XXXXXX"; }  # BSD
+fi
+
 # Determine trash directory based on OS and user
 get_trash_base() {
 	if [[ $USER_ID -eq 0 ]]; then
@@ -165,7 +182,7 @@ init() {
 	TRASH_INFO_DIR="$TRASH_BASE_DIR/info"
 	LOG_FILE="$TRASH_BASE_DIR/rm_safe.log"
 
-	mkdir -p "$TRASH_FILES_DIR" "$TRASH_INFO_DIR" 2>/dev/null || {
+	"$GMKDIR" -p "$TRASH_FILES_DIR" "$TRASH_INFO_DIR" 2>/dev/null || {
 		echo "rm-safe: Error: Cannot create trash directories" >&2
 		exit 1
 	}
@@ -303,13 +320,13 @@ restore_trash_entry() {
 		original_dir="."
 	fi
 	if [[ ! -d $original_dir ]]; then
-		mkdir -p -- "$original_dir" || {
+		"$GMKDIR" -p -- "$original_dir" || {
 			echo "rm-safe: Error: Cannot create directory: $original_dir" >&2
 			return 1
 		}
 	fi
 
-	if mv -- "$trash_path" "$original_path"; then
+	if "$GMV" -- "$trash_path" "$original_path"; then
 		local info_file="$TRASH_INFO_DIR/${trash_path##*/}.trashinfo"
 		[[ -e $info_file ]] && command -p rm -f -- "$info_file"
 		log_action "TRASH_RESTORE" "$trash_path" "$original_path"
@@ -395,7 +412,7 @@ undo_picker() {
 	local selection __pick_dir __pick_in __pick_out __pick_rc
 	# Use a private mktemp dir (not a predictable /tmp/...$$ path) so the picker
 	# output file can't be pre-created/symlinked by another local user.
-	__pick_dir=$(mktemp -d "${TMPDIR:-/tmp}/rm-safe-pick.XXXXXX") || return 1
+	__pick_dir=$("$GMKTEMP" -d "${TMPDIR:-/tmp}/rm-safe-pick.XXXXXX") || return 1
 	__pick_in="$__pick_dir/in"
 	__pick_out="$__pick_dir/out"
 	printf '%s\n' "${menu[@]}" >"$__pick_in"
@@ -708,7 +725,7 @@ trash_item() {
 	get_unique_name_into trash_name "$base_name"
 	local trash_path="$TRASH_FILES_DIR/$trash_name"
 
-	if mv -- "$abs_path" "$trash_path"; then
+	if "$GMV" -- "$abs_path" "$trash_path"; then
 		create_trashinfo "$abs_path" "$trash_name"
 		log_action "TRASH_MANUAL" "$abs_path" "$trash_path"
 		verbose "Moved '$item' to trash as '$trash_name'"
@@ -829,7 +846,7 @@ run_tests() {
 	local pass=0 fail=0
 	# Use mktemp for safer temporary directory creation
 	# User requested --tmpdir -d
-	TEST_DIR=$(mktemp --tmpdir -d rm_safe_test.XXXXXX) || {
+	TEST_DIR=$(_mktemp_dir rm_safe_test) || {
 		echo "Error: Failed to create temporary directory" >&2
 		return 1
 	}

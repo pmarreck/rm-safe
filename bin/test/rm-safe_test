@@ -307,6 +307,23 @@ else
 	fi
 fi
 
+# Test: bash impl prefers a g-prefixed tool when available
+((tests++))
+gshim="$TEST_DIR/gshim"; mkdir -p "$gshim"
+cat >"$gshim/gmktemp" <<EOF
+#!/usr/bin/env bash
+echo "GMKTEMP_USED" >>"$TEST_DIR/gmktemp.trace"
+exec mktemp "\$@"
+EOF
+chmod +x "$gshim/gmktemp"
+env HOME="$HOME_DIR" PATH="$gshim:$PATH_BASE" "$REPO_ROOT/bin/rm-safe.bash" --test >/dev/null 2>&1 || true
+if [[ -f "$TEST_DIR/gmktemp.trace" ]]; then
+	echo "OK bash impl used g-prefixed gmktemp when present"
+else
+	echo "FAIL g-prefixed tool not preferred" >&2
+	((fails++))
+fi
+
 echo "=== Test Summary ==="
 echo "Passed: $((tests - fails - skips))"
 echo "Skipped: $skips" >&2
