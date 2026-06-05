@@ -15,33 +15,67 @@ environment. Neither is ever required.
 
 1. `bin/rm-safe` is a LuaJIT script (`require("lfs")`). It only runs where
    luajit + lfs resolve. Non-luajit users are stranded.
-2. `bin/rm-safe.bash` (the baseline) assumes GNU semantics
-   (`mktemp --tmpdir`, `readlink -f`, `sed -i`, `stat -c`, `date -d`,
-   `find -printf`). On stock macOS those are BSD tools and behave differently
-   or lack the flags — so the "portable" baseline isn't actually portable.
+2. **`bin/rm-safe.bash` is broken on stock macOS — the real, dangerous blocker.**
+   It uses bash-4+ associative arrays (`local -A opts`, line 953) and `mapfile`
+   (line 325). Apple freezes `/bin/bash` at **3.2** (GPLv3), where assoc arrays
+   don't exist: under `set -u` the script dies with `force: unbound variable`,
+   **exits 0, and never trashes the file** — a silent no-op in an `rm`
+   replacement. (Audited: GNU-vs-BSD coreutils were NOT the blocker — BSD
+   `mktemp` accepted `--tmpdir`, readlink/realpath already have BSD fallbacks.)
 3. The test suite (`bin/test/rm-safe_test`) always exercises the luajit impl
    (resolves `rm-safe` from PATH). The bash impl is never tested, so the two
-   can silently drift in feature or behavior.
+   can silently drift in feature or behavior. Neither bash version is tested.
 4. There is no project `flake.nix`, so Nix users have no reproducible
    dev/test/CI environment and the global luajit-lfs gap (see
    `~/.config/nix/flake.nix`) is the only thing making the luajit impl work.
 
 ## Decisions (locked)
 
-- **Single selector env var: `RM_SAFE_BIN`** (absolute path to the impl).
-  No `RM_SAFE_IMPL`. Honored by both the `bin/rm` shim and the test suite.
-- **Bash impl prefers GNU tooling by g-prefixed names** when present, with a
-  verified-GNU plain fallback, and **real BSD code paths** when only BSD tools
-  exist. Implemented now (it is what delivers the accessibility goal).
-- **`rm-safe.bash` stays self-contained** (inline resolver prelude, copy-and-go
-  single file) rather than sourcing a shared lib.
+- **Single selector env var: `RM_SAFE_BIN`** (absolute path to an executable).
+  No `RM_SAFE_IMPL`. Honored by both the `bin/rm` shim and the test suite. The
+  three test lanes point it at small wrapper execs that pin the interpreter, so
+  the one-knob design is preserved.
+- **Keep bash-4+ features but gate them.** Detect the running bash early into a
+  `BASH4` flag (`1` if `BASH_VERSINFO[0] >= 4`, else `0`); gate the 4+-only
+  constructs with a 3.2-compatible fallback. Do **not** dumb the script down to
+  3.2 unconditionally. The two 4+ constructs to gate: the `opts` associative
+  array and `mapfile` (full audit confirms these are the only two).
+- **Three-version test matrix:** luajit, bash-4+, bash-3.2. Each runs the full
+  `rm-safe_test` suite; lanes skip gracefully when their runtime is absent
+  (e.g. no bash-3.2 on Linux CI).
+- **Bash impl still prefers GNU tooling by g-prefixed names** for call-site
+  clarity, with fallback chain g-prefixed → detected-GNU (`--version | grep -qi
+  GNU`) → BSD. (Now largely cosmetic for correctness, since BSD tools work, but
+  retained per request.)
+- **`rm-safe.bash` stays self-contained** (inline prelude, copy-and-go single
+  file) rather than sourcing a shared lib.
+- **Degraded-setup warnings, suppressible.** Warn once to stderr when (a)
+  running under bash 3.2, or (b) luajit is unavailable so the bash impl is used.
+  Both are silenced by a single env var **`RM_SAFE_QUIET`** (truthy = no warn).
+  Warnings go to stderr only and never change exit codes or stdout.
 - **flake.nix scope: devShell + checks + packages.** Convenience only.
 
 ## Components
 
 ### 1. `rm-safe.bash` — universal, self-contained, zero-dependency
 
-Inline **tool-resolution prelude** near the top. For each resolved tool, pick a
+**Bash-version gating (the real portability fix).** Early in the script, set
+`BASH4=1` when `${BASH_VERSINFO[0]} -ge 4`, else `BASH4=0`. Gate the two 4+-only
+constructs:
+
+- **`opts` associative array** → reach it through accessors `opt_get <name>` /
+  `opt_set <name> <val>`. Internally: assoc array when `BASH4=1`, four scalar
+  vars (`__opt_force` …) when `BASH4=0`. The ~19 call sites use the accessors,
+  so the 4+ feature is kept where available and 3.2 still works.
+- **`mapfile -t arr < <(...)`** (line 325) → `if BASH4: mapfile; else: while
+  IFS= read -r line; do arr+=("$line"); done`.
+
+**Degraded-setup warning.** If `BASH4=0` and `RM_SAFE_QUIET` is not truthy, emit
+one stderr line: `rm-safe: note: running under bash ${BASH_VERSION%%(*}; install
+bash 4+ or luajit for full speed/features (set RM_SAFE_QUIET=1 to silence)`.
+stderr only; does not affect exit code or stdout.
+
+**Tool-resolution prelude.** Inline near the top. For each resolved tool, pick a
 binary and (where it matters) record the detected flavor (gnu|bsd):
 
 Resolution order per tool:
@@ -97,15 +131,27 @@ Selection order (recursion guards from current shim preserved):
 
 A non-Nix/non-luajit user automatically gets the bash impl with no config.
 
+When the shim falls back to the bash impl **because luajit was unavailable**
+(case 3 reached due to no luajit, not because `RM_SAFE_BIN` forced it), and
+`RM_SAFE_QUIET` is not truthy, warn once to stderr:
+`rm-safe: note: luajit not found; using slower bash implementation (set
+RM_SAFE_QUIET=1 to silence)`. Never warn when the user explicitly selected an
+impl via `RM_SAFE_BIN`.
+
 ### 4. `RM_SAFE_BIN` selector + run-both harness
 
 - `bin/test/rm-safe_test` honors `RM_SAFE_BIN`: drops a `BIN_DIR/rm-safe`
   symlink (BIN_DIR is already first on `PATH_BASE`) pointing at the selected
   impl, so every `run_cmd` hits it. Unset → default `$REPO_ROOT/bin/rm-safe`
   (luajit), so `rm-safe --test` and current behavior are unchanged.
-- `bin/test/run-all` loops `RM_SAFE_BIN` over `{bin/rm-safe, bin/rm-safe.bash}`,
-  runs `rm-safe_test` per impl, prints a per-impl summary, exits non-zero if any
-  impl fails. Accepts narrowing (run a single impl) for fast iteration.
+- `bin/test/run-all` runs the suite across **three lanes**, each pinned via a
+  tiny wrapper exec it generates in a temp dir (so `RM_SAFE_BIN` stays the one
+  knob): **luajit** (`bin/rm-safe`), **bash-4+** (`<bash4> bin/rm-safe.bash`),
+  **bash-3.2** (`<bash3.2> bin/rm-safe.bash`). It detects available runtimes
+  (`luajit`, a bash ≥4, a bash 3.2 e.g. `/bin/bash` on macOS) and **skips a lane
+  with a logged note** when its runtime is absent (e.g. no 3.2 on Linux CI).
+  Prints a per-lane summary, exits non-zero if any run lane fails. Accepts
+  narrowing (`--lane luajit|bash4|bash32`) for fast iteration.
 - `rm_override_test` runs **once** (it uses a fake `rm-safe`, so it is
   implementation-agnostic) **plus a new test-first case** asserting the shim
   routes to the bash impl when `RM_SAFE_BIN=.../rm-safe.bash`.
@@ -152,8 +198,9 @@ body    → calls only $GTOOL vars and _wrapper functions (platform-blind)
 
 ## Testing strategy
 
-- Parity is the headline test: `run-all` runs the full suite against **both**
-  impls every invocation; any divergence fails.
+- Parity is the headline test: `run-all` runs the full suite across **all three
+  lanes** (luajit, bash-4+, bash-3.2) every invocation; any divergence fails.
+  The bash-3.2 lane is the regression guard for the silent-no-op bug.
 - The g-prefix→GNU→BSD resolver is validated implicitly by running the bash
   suite under different toolchains (stock macOS BSD tools; GNU/Linux; nix
   g-prefixed). The Nix `checks.tests` covers the GNU/g-prefixed lane in CI.
