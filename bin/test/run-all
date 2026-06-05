@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Run the rm-safe test suite across three lanes: luajit, bash-4+, bash-3.2.
+# Each lane pins its interpreter via a generated wrapper exec that RM_SAFE_BIN
+# points at, so the suite's single RM_SAFE_BIN knob is preserved. Lanes whose
+# runtime is unavailable are SKIPPED with a logged note (e.g. no bash-3.2 on
+# Linux CI). Exits non-zero if any RUN lane fails.
+
+set -uo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SUITE="$REPO_ROOT/bin/test/rm-safe_test"
+OVERRIDE_SUITE="$REPO_ROOT/bin/test/rm_override_test"
+LUAJIT_IMPL="$REPO_ROOT/bin/rm-safe"
+BASH_IMPL="$REPO_ROOT/bin/rm-safe.bash"
+
+WANT_LANE="${1:-}"; [[ $WANT_LANE == --lane ]] && WANT_LANE="${2:-}"
+
+WRAP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rm-safe-lanes.XXXXXX")
+trap '/bin/rm -rf "$WRAP_DIR"' EXIT
+
+# Find a bash whose major version matches $1 (4 means ">=4"). Echo its path or "".
+find_bash() {
+	local want=$1 c ver major
+	for c in /bin/bash /usr/bin/bash /usr/local/bin/bash /opt/homebrew/bin/bash \
+	         /run/current-system/sw/bin/bash "$(command -v bash 2>/dev/null)"; do
+		[[ -x $c ]] || continue
+		ver=$("$c" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null) || continue
+		major=$ver
+		if [[ $want == 4 && $major -ge 4 ]]; then echo "$c"; return 0; fi
+		if [[ $want == 3 && $major -eq 3 ]]; then echo "$c"; return 0; fi
+	done
+	echo ""
+}
+
+make_wrapper() { # $1 = wrapper path, $2 = interpreter ("" = none), $3 = impl
+	local w=$1 interp=$2 impl=$3
+	if [[ -n $interp ]]; then
+		printf '#!/bin/sh\nexec %q %q "$@"\n' "$interp" "$impl" >"$w"
+	else
+		printf '#!/bin/sh\nexec %q "$@"\n' "$impl" >"$w"
+	fi
+	chmod +x "$w"
+}
+
+declare -i lanes_run=0 lanes_failed=0
+
+run_lane() { # $1 = lane name, $2 = RM_SAFE_BIN wrapper
+	local name=$1 bin=$2
+	[[ -n $WANT_LANE && $WANT_LANE != "$name" ]] && return 0
+	echo
+	echo "########## LANE: $name  ($bin) ##########"
+	lanes_run+=1
+	if ! RM_SAFE_BIN="$bin" "$SUITE"; then
+		lanes_failed+=1
+		echo ">>> LANE $name FAILED" >&2
+	fi
+}
+
+skip_lane() { echo; echo "########## LANE: $1 — SKIPPED ($2) ##########"; }
+
+# luajit lane
+if [[ -x $LUAJIT_IMPL ]] && command -v luajit >/dev/null 2>&1 \
+	&& luajit -e 'require("lfs")' >/dev/null 2>&1; then
+	make_wrapper "$WRAP_DIR/luajit" "" "$LUAJIT_IMPL"
+	run_lane luajit "$WRAP_DIR/luajit"
+else
+	skip_lane luajit "luajit+lfs not available"
+fi
+
+# bash-4+ lane
+B4=$(find_bash 4)
+if [[ -n $B4 ]]; then
+	make_wrapper "$WRAP_DIR/bash4" "$B4" "$BASH_IMPL"
+	run_lane bash4 "$WRAP_DIR/bash4"
+else
+	skip_lane bash4 "no bash >= 4 found"
+fi
+
+# bash-3.2 lane
+B3=$(find_bash 3)
+if [[ -n $B3 ]]; then
+	make_wrapper "$WRAP_DIR/bash32" "$B3" "$BASH_IMPL"
+	run_lane bash32 "$WRAP_DIR/bash32"
+else
+	skip_lane bash32 "no bash 3.x found (expected on Linux)"
+fi
+
+# shim tests run once (implementation-agnostic)
+if [[ -z $WANT_LANE ]]; then
+	echo; echo "########## rm_override_test (shim) ##########"
+	lanes_run+=1
+	if ! "$OVERRIDE_SUITE"; then lanes_failed+=1; echo ">>> shim tests FAILED" >&2; fi
+fi
+
+echo
+echo "==================== run-all summary ===================="
+echo "lanes run: $lanes_run   lanes failed: $lanes_failed"
+exit $(( lanes_failed > 0 ? 1 : 0 ))
