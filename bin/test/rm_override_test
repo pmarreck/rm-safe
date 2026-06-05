@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RM_SHIM="$REPO_ROOT/bin/rm"
 SELF="$RM_SHIM"
 
-test_dir=$(mktemp -d --tmpdir rm-override-test.XXXXXX)
+test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rm-override-test.XXXXXX")
 trap 'rm -rf "$test_dir"' EXIT
 
 # PATH must still contain bash/dirname/etc for the shim's shebang; avoid rm-safe presence

@@ -6,7 +6,13 @@ skips=0
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$REPO_ROOT/bin/test/capture.bash"
-TEST_DIR=$(mktemp -d --tmpdir rm-safe-test.XXXXXX)
+
+# Portable temp-dir creation (GNU --tmpdir is unavailable on BSD mktemp).
+_mk_tmpdir() { # $1 = name prefix
+	mktemp -d "${TMPDIR:-/tmp}/$1.XXXXXX"
+}
+
+TEST_DIR=$(_mk_tmpdir rm-safe-test)
 trap 'command -p rm -rf "$TEST_DIR"' EXIT
 
 HOME_DIR="$TEST_DIR/home"
@@ -18,6 +24,16 @@ HOST_PATH="$PATH"
 PATH_BASE="$BIN_DIR:$BASH_DIR:$REPO_ROOT/bin:$HOST_PATH"
 
 mkdir -p "$HOME_DIR" "$XDG_DIR" "$WORK_DIR" "$BIN_DIR"
+
+# Select the implementation under test. RM_SAFE_BIN (absolute path) wins;
+# default is the luajit impl. We expose it as $BIN_DIR/rm-safe, and $BIN_DIR
+# is first on PATH_BASE, so every `rm-safe` invocation hits the selected impl.
+RM_SAFE_BIN=${RM_SAFE_BIN:-"$REPO_ROOT/bin/rm-safe"}
+if [[ ! -x $RM_SAFE_BIN ]]; then
+	echo "rm-safe_test: RM_SAFE_BIN=$RM_SAFE_BIN is not executable" >&2
+	exit 2
+fi
+ln -sf -- "$RM_SAFE_BIN" "$BIN_DIR/rm-safe"
 
 cat >"$BIN_DIR/gio" <<'GIO'
 #!/usr/bin/env bash
@@ -134,6 +150,15 @@ run_cmd_expect() {
 	RM_ERR="$err"
 	RM_RC="$rc"
 }
+
+# Test 0: the selected impl is the one being exercised
+((tests++))
+if [[ "$(readlink "$BIN_DIR/rm-safe")" == "$RM_SAFE_BIN" ]]; then
+	echo "OK exercising impl: $RM_SAFE_BIN"
+else
+	echo "FAIL impl selection wrong" >&2
+	((fails++))
+fi
 
 # Test 1: --undo restores last TRASH_MANUAL and logs TRASH_RESTORE
 reset_trash
