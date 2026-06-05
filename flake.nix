@@ -31,6 +31,12 @@
         ];
 
         testDeps = runtimeDeps ++ [ pkgs.bashInteractive pkgs.expect pkgs.coreutils ];
+
+        # checkDeps omits gum/fzf so the suite skips the pty-driven picker tests
+        # (gum/fzf drive a pty via expect which is flaky/broken in the headless
+        # nix sandbox).  The core undo/restore parity tests still run.
+        # gum/fzf remain in testDeps so the devShell gets them for local testing.
+        checkDeps = lib.filter (d: d != pkgs.gum && d != pkgs.fzf) testDeps;
       in {
         packages = rec {
           rm-safe = pkgs.stdenv.mkDerivation {
@@ -75,5 +81,14 @@
             echo "run tests: bin/test/run-all"
           '';
         };
+
+        checks.tests = pkgs.runCommand "rm-safe-tests"
+          { nativeBuildInputs = checkDeps ++ [ luajitWithLfs ]; }
+          ''
+            cp -r ${./.} src && chmod -R u+w src && cd src
+            export HOME=$TMPDIR
+            bin/test/run-all
+            touch $out
+          '';
       });
 }
