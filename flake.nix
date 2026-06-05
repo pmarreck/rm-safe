@@ -55,6 +55,11 @@
                 --prefix PATH : ${lib.makeBinPath runtimeDeps}
               wrapProgram $out/bin/rm-safe.bash \
                 --prefix PATH : ${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
+              # Wrap the dispatch shim so it can reach its bundled luajit impl
+              # ($out/bin holds rm-safe + rm-safe.bash) and the runtime tools;
+              # otherwise it would always fall back to the slower bash impl.
+              wrapProgram $out/bin/rm \
+                --prefix PATH : ${luajitWithLfs}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
             '';
           };
           rm-safe-bash = pkgs.stdenv.mkDerivation {
