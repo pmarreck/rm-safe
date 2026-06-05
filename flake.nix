@@ -32,6 +32,42 @@
 
         testDeps = runtimeDeps ++ [ pkgs.bashInteractive pkgs.expect pkgs.coreutils ];
       in {
+        packages = rec {
+          rm-safe = pkgs.stdenv.mkDerivation {
+            pname = "rm-safe"; version = "5.0";
+            src = ./.;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            dontConfigure = true;
+            dontBuild = true;
+            installPhase = ''
+              mkdir -p $out/bin
+              cp bin/rm-safe $out/bin/rm-safe-luajit
+              cp bin/rm-safe.bash $out/bin/rm-safe.bash
+              cp bin/rm $out/bin/rm
+              makeWrapper ${luajitWithLfs}/bin/luajit $out/bin/rm-safe \
+                --add-flags $out/bin/rm-safe-luajit \
+                --prefix PATH : ${lib.makeBinPath runtimeDeps}
+              wrapProgram $out/bin/rm-safe.bash \
+                --prefix PATH : ${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
+            '';
+          };
+          rm-safe-bash = pkgs.stdenv.mkDerivation {
+            pname = "rm-safe-bash"; version = "5.0";
+            src = ./.;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            dontConfigure = true;
+            dontBuild = true;
+            installPhase = ''
+              mkdir -p $out/bin
+              cp bin/rm-safe.bash $out/bin/rm-safe-bash-impl
+              makeWrapper ${pkgs.bashInteractive}/bin/bash $out/bin/rm-safe-bash \
+                --add-flags $out/bin/rm-safe-bash-impl \
+                --prefix PATH : ${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
+            '';
+          };
+          default = rm-safe;
+        };
+
         devShells.default = pkgs.mkShell {
           packages = [ luajitWithLfs ] ++ testDeps;
           shellHook = ''
