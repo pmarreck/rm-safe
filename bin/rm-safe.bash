@@ -31,6 +31,14 @@ else
 	opt_set() { printf -v "__opt_$1" '%s' "$2"; }
 fi
 
+# Degraded-setup nudge (stderr only; never affects stdout or exit code).
+__rm_safe_quiet=false
+case "${RM_SAFE_QUIET:-}" in 1|true|yes|on) __rm_safe_quiet=true ;; esac
+if [[ $BASH4 -eq 0 && $__rm_safe_quiet == false ]]; then
+	printf 'rm-safe: note: running under bash %s; install bash 4+ or luajit for full speed/features (set RM_SAFE_QUIET=1 to silence)\n' \
+		"${BASH_VERSION%%(*}" >&2
+fi
+
 # Determine trash directory based on OS and user
 get_trash_base() {
 	if [[ $USER_ID -eq 0 ]]; then

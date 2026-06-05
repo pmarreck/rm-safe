@@ -290,6 +290,23 @@ else
 	fi
 fi
 
+# Test: bash 3.2 emits a suppressible degraded-setup warning
+((tests++))
+B32=""
+for c in /bin/bash; do v=$("$c" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null); [[ $v == 3 ]] && B32=$c; done
+if [[ -z $B32 ]]; then
+	skip_test "bash32 warning" "no bash 3.x present"
+else
+	warn_out=$(env HOME="$HOME_DIR" PATH="$PATH_BASE" "$B32" "$REPO_ROOT/bin/rm-safe.bash" --about 2>&1 >/dev/null)
+	quiet_out=$(env HOME="$HOME_DIR" PATH="$PATH_BASE" RM_SAFE_QUIET=1 "$B32" "$REPO_ROOT/bin/rm-safe.bash" --about 2>&1 >/dev/null)
+	if printf '%s' "$warn_out" | grep -qi "running under bash" && ! printf '%s' "$quiet_out" | grep -qi "running under bash"; then
+		echo "OK bash 3.2 warning emitted and suppressible"
+	else
+		echo "FAIL bash 3.2 warning behavior wrong" >&2
+		((fails++))
+	fi
+fi
+
 echo "=== Test Summary ==="
 echo "Passed: $((tests - fails - skips))"
 echo "Skipped: $skips" >&2
