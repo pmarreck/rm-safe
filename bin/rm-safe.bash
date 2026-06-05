@@ -11,6 +11,26 @@ readonly USER_ID="$EUID"
 readonly USER_NAME="$(id -un)"
 readonly PICKER_DELIM="__RM_SAFE_PICKER__"
 
+# --- Bash version gating ---------------------------------------------------
+# Apple ships /bin/bash 3.2 (no associative arrays). Detect once; keep bash-4+
+# features where present, fall back on 3.2.
+if [[ ${BASH_VERSINFO[0]} -ge 4 ]]; then
+	BASH4=1
+else
+	BASH4=0
+fi
+
+# Option storage, accessed via opt_get/opt_set so the body is version-blind.
+if [[ $BASH4 -eq 1 ]]; then
+	declare -A __opts=( [force]=false [interactive]=false [recursive]=false [verbose]=false )
+	opt_get() { printf '%s' "${__opts[$1]}"; }
+	opt_set() { __opts[$1]=$2; }
+else
+	__opt_force=false; __opt_interactive=false; __opt_recursive=false; __opt_verbose=false
+	opt_get() { local __v="__opt_$1"; printf '%s' "${!__v}"; }
+	opt_set() { printf -v "__opt_$1" '%s' "$2"; }
+fi
+
 # Determine trash directory based on OS and user
 get_trash_base() {
 	if [[ $USER_ID -eq 0 ]]; then
@@ -982,22 +1002,16 @@ run_tests() {
 
 # --- Main ---
 main() {
-	local -A opts=(
-		[force]=false
-		[interactive]=false
-		[recursive]=false
-		[verbose]=false
-	)
 	local undo_mode=""
 	local undo_offset_arg=""
 
 	# Parse options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-			-f|--force)       opts[force]=true ;;
-			-i|--interactive) opts[interactive]=true ;;
-			-r|-R|--recursive) opts[recursive]=true ;;
-			-v|--verbose)     opts[verbose]=true ;;
+			-f|--force)       opt_set force true ;;
+			-i|--interactive) opt_set interactive true ;;
+			-r|-R|--recursive) opt_set recursive true ;;
+			-v|--verbose)     opt_set verbose true ;;
 			-a|--about)       echo "rm-safe: A safer 'rm' that moves files to the system trash instead of permanently deleting them."; exit 0 ;;
 			-h|--help)        show_help; exit 0 ;;
 			--undo|--undo=*)
@@ -1028,10 +1042,10 @@ main() {
 				;;
 			--test)
 				# Export options for test suite
-				export FORCE=${opts[force]}
-				export INTERACTIVE=${opts[interactive]}
-				export RECURSIVE=${opts[recursive]}
-				export VERBOSE=${opts[verbose]}
+				export FORCE=$(opt_get force)
+				export INTERACTIVE=$(opt_get interactive)
+				export RECURSIVE=$(opt_get recursive)
+				export VERBOSE=$(opt_get verbose)
 				run_tests
 				exit $?
 				;;
@@ -1041,10 +1055,10 @@ main() {
 				local flags="${1#-}"
 				for ((i=0; i<${#flags}; i++)); do
 					case "${flags:$i:1}" in
-						f) opts[force]=true ;;
-						i) opts[interactive]=true ;;
-						r|R) opts[recursive]=true ;;
-						v) opts[verbose]=true ;;
+						f) opt_set force true ;;
+						i) opt_set interactive true ;;
+						r|R) opt_set recursive true ;;
+						v) opt_set verbose true ;;
 						a) echo "rm-safe: A safer 'rm' that moves files to the system trash instead of permanently deleting them."; exit 0 ;;
 						h) show_help; exit 0 ;;
 						*)
@@ -1096,10 +1110,10 @@ main() {
 	init
 
 	# Export options for functions
-	export FORCE=${opts[force]}
-	export INTERACTIVE=${opts[interactive]}
-	export RECURSIVE=${opts[recursive]}
-	export VERBOSE=${opts[verbose]}
+	export FORCE=$(opt_get force)
+	export INTERACTIVE=$(opt_get interactive)
+	export RECURSIVE=$(opt_get recursive)
+	export VERBOSE=$(opt_get verbose)
 
 	# Process items
 	local exit_code=0
@@ -1108,7 +1122,7 @@ main() {
 
 		# Check existence (skip error if force flag is set)
 		if [[ ! -e $item && ! -L $item ]]; then
-			if [[ ${opts[force]} != true ]]; then
+			if [[ "$(opt_get force)" != true ]]; then
 				echo "rm-safe: '$item': No such file or directory" >&2
 				log_action "FAIL_NOEXIST" "$item"
 				exit_code=1
@@ -1117,7 +1131,7 @@ main() {
 		fi
 
 		# Check directory without recursive
-		if [[ -d $item && ! -L $item && ${opts[recursive]} == false ]]; then
+		if [[ -d $item && ! -L $item && "$(opt_get recursive)" == false ]]; then
 			local resolved_item=""
 			echo "rm-safe: '$item': Is a directory (use -r)" >&2
 			resolve_path_into resolved_item "$item"
@@ -1127,7 +1141,7 @@ main() {
 		fi
 
 		# Handle directories atomically
-		if [[ -d $item && ! -L $item && ${opts[recursive]} == true ]]; then
+		if [[ -d $item && ! -L $item && "$(opt_get recursive)" == true ]]; then
 			verbose "Atomically moving directory to trash: $item"
 			if ! trash_item "$item"; then
 				exit_code=1
