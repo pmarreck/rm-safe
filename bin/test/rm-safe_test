@@ -36,13 +36,13 @@ fi
 ln -sf -- "$RM_SAFE_BIN" "$BIN_DIR/rm-safe"
 
 cat >"$BIN_DIR/gio" <<'GIO'
-#!/usr/bin/env bash
+#!/bin/sh
 exit 1
 GIO
 chmod +x "$BIN_DIR/gio"
 
 cat >"$BIN_DIR/trash-put" <<'TRASHPUT'
-#!/usr/bin/env bash
+#!/bin/sh
 exit 1
 TRASHPUT
 chmod +x "$BIN_DIR/trash-put"
@@ -311,7 +311,7 @@ fi
 ((tests++))
 gshim="$TEST_DIR/gshim"; mkdir -p "$gshim"
 cat >"$gshim/gmktemp" <<EOF
-#!/usr/bin/env bash
+#!/bin/sh
 echo "GMKTEMP_USED" >>"$TEST_DIR/gmktemp.trace"
 exec mktemp "\$@"
 EOF

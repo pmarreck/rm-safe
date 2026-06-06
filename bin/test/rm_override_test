@@ -20,7 +20,7 @@ PATH_SAFE="/usr/local/bin:/usr/bin:/bin"
 # of whether this machine actually has luajit installed.
 LUAJIT_STUB_DIR="$test_dir/with_luajit"
 mkdir -p "$LUAJIT_STUB_DIR"
-printf '#!/usr/bin/env bash\nexit 0\n' >"$LUAJIT_STUB_DIR/luajit"
+printf '#!/bin/sh\nexit 0\n' >"$LUAJIT_STUB_DIR/luajit"
 chmod +x "$LUAJIT_STUB_DIR/luajit"
 
 # A PATH guaranteed to have no luajit: filter out any PATH_SAFE dir that contains luajit.
@@ -42,7 +42,7 @@ run_cmd() {
 ((tests++))
 rm_safe_fake="$test_dir/rm-safe"
 cat >"$rm_safe_fake" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/sh
 echo "rm-safe invoked" >"$TMPDIR/rm-safe-called"
 EOF
 chmod +x "$rm_safe_fake"
@@ -64,7 +64,7 @@ shim2_dir="$test_dir/shim2"
 mkdir -p "$shim2_dir"
 real_rm_fake="$test_dir/real-rm"
 cat >"$real_rm_fake" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/sh
 echo "real rm used" >"$TMPDIR/real-rm-called"
 EOF
 chmod +x "$real_rm_fake"
@@ -112,7 +112,7 @@ fi
 ((tests++))
 override_fake="$test_dir/override-impl"
 cat >"$override_fake" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/sh
 echo "override invoked" >"$TMPDIR/override-called"
 EOF
 chmod +x "$override_fake"
@@ -128,7 +128,7 @@ fi
 ((tests++))
 bash_impl_fake="$test_dir/rm-safe.bash"
 cat >"$bash_impl_fake" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/sh
 echo "bash impl invoked" >"$TMPDIR/bash-impl-called"
 EOF
 chmod +x "$bash_impl_fake"

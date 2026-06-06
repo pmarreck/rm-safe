@@ -91,6 +91,10 @@
           { nativeBuildInputs = checkDeps ++ [ luajitWithLfs ]; }
           ''
             cp -r ${./.} src && chmod -R u+w src && cd src
+            # The Linux build sandbox has /bin/sh but no /usr/bin/env, so the
+            # committed scripts' '#!/usr/bin/env bash|luajit' shebangs must be
+            # rewritten to absolute store paths before they can run.
+            patchShebangs bin
             export HOME=$TMPDIR
             bin/test/run-all
             touch $out
