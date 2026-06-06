@@ -13,7 +13,8 @@ _mk_tmpdir() { # $1 = name prefix
 }
 
 TEST_DIR=$(_mk_tmpdir rm-safe-test)
-trap 'command -p rm -rf "$TEST_DIR"' EXIT
+REAL_RM=$([ -x /bin/rm ] && echo /bin/rm || command -v rm || echo rm)
+trap '"$REAL_RM" -rf "$TEST_DIR"' EXIT
 
 HOME_DIR="$TEST_DIR/home"
 XDG_DIR="$TEST_DIR/xdg"
@@ -59,8 +60,8 @@ LOG_FILE="$TRASH_BASE/rm_safe.log"
 
 reset_trash() {
 	mkdir -p "$TRASH_FILES" "$TRASH_INFO"
-	find "$TRASH_FILES" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} + 2>/dev/null || true
-	find "$TRASH_INFO" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} + 2>/dev/null || true
+	find "$TRASH_FILES" -mindepth 1 -maxdepth 1 -exec "$REAL_RM" -rf {} + 2>/dev/null || true
+	find "$TRASH_INFO" -mindepth 1 -maxdepth 1 -exec "$REAL_RM" -rf {} + 2>/dev/null || true
 	: >"$LOG_FILE"
 }
 

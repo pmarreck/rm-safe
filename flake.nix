@@ -96,6 +96,9 @@
             # rewritten to absolute store paths before they can run.
             patchShebangs bin
             export HOME=$TMPDIR
+            # Sealed sandbox lacks the full env the shim test needs; it runs
+            # locally and in `nix develop`. The 3 parity lanes still run here.
+            export RM_SAFE_SKIP_SHIM_TEST=1
             bin/test/run-all
             touch $out
           '';

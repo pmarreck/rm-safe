@@ -15,7 +15,10 @@ BASH_IMPL="$REPO_ROOT/bin/rm-safe.bash"
 WANT_LANE="${1:-}"; [[ $WANT_LANE == --lane ]] && WANT_LANE="${2:-}"
 
 WRAP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rm-safe-lanes.XXXXXX")
-trap '/bin/rm -rf "$WRAP_DIR"' EXIT
+# Resolve a real rm: the nix build sandbox has no /bin/rm, but coreutils
+# puts rm on PATH; on dev/macOS prefer /bin/rm (bypasses any rm-safe shim).
+RM_BIN=$([ -x /bin/rm ] && echo /bin/rm || command -v rm || echo rm)
+trap '"$RM_BIN" -rf "$WRAP_DIR"' EXIT
 
 # Hang guard: wrap suite runs in a timeout if one is available (coreutils
 # `timeout`/`gtimeout`). Stock macOS lacks it; then we run unguarded.
@@ -90,7 +93,14 @@ else
 fi
 
 # shim tests run once (implementation-agnostic)
-if [[ -z $WANT_LANE ]]; then
+if [[ -n $WANT_LANE ]]; then
+	: # narrowed to one lane; shim test is impl-agnostic, skip it
+elif [[ -n ${RM_SAFE_SKIP_SHIM_TEST:-} ]]; then
+	# The shim test drives bash -c / fake interpreters and assumes a full
+	# environment (bash + rm on standard paths) the nix build sandbox lacks.
+	# It runs locally and in `nix develop`; skipped only in the sealed check.
+	echo; echo "########## rm_override_test (shim) — SKIPPED (RM_SAFE_SKIP_SHIM_TEST) ##########"
+else
 	echo; echo "########## rm_override_test (shim) ##########"
 	lanes_run+=1
 	if ! $TIMEOUT_CMD "$OVERRIDE_SUITE"; then lanes_failed+=1; echo ">>> shim tests FAILED" >&2; fi
