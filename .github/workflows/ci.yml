@@ -1,0 +1,30 @@
+name: CI
+
+# Garnix already builds packages + the parity-lane check in its sealed sandbox.
+# This workflow covers what that sandbox CANNOT: the shim test (rm_override_test),
+# which drives `bash -c` and fake interpreters and needs a full environment, and
+# — on the macOS runner — the real bash 3.2 lane (Apple's /bin/bash), which
+# Garnix's Linux builders can't provide.
+
+on:
+  push:
+    branches: [yolo]
+  pull_request:
+    branches: [yolo]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # Full suite in the dev shell: all available lanes PLUS the shim test.
+      # On macos-latest /bin/bash is 3.2, so the bash32 lane runs for real here.
+      - name: Run full test suite (parity lanes + shim test)
+        run: nix develop -c bin/test/run-all

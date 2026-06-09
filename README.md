@@ -1,6 +1,9 @@
 rm-safe
 ======
 
+[![CI](https://github.com/pmarreck/rm_safe/actions/workflows/ci.yml/badge.svg?branch=yolo)](https://github.com/pmarreck/rm_safe/actions/workflows/ci.yml)
+[![Garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Frm_safe%3Fbranch%3Dyolo)](https://garnix.io/repo/pmarreck/rm_safe)
+
 Safe `rm` that moves files to Trash instead of permanently deleting them. Includes a small `rm` shim and guidance for macOS, common Linux sudoers setups, and NixOS.
 
 Features
