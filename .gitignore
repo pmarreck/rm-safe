@@ -2,3 +2,8 @@
 .codescan
 result
 result-*
+
+# Watchman leftovers from the pre-jj-rescission era (2026-07-09).
+# jj coupled to watchman for filesystem notifications; when jj was
+# retired the cookies stopped being cleaned up. Ignore & sweep.
+.watchman-cookie-*
