@@ -4,6 +4,8 @@ local lfs = require("lfs")
 local ffi = require("ffi")
 
 ffi.cdef[[
+struct rmsafe_timespec { int64_t tv_sec; int64_t tv_nsec; };
+int clock_gettime(int clk_id, struct rmsafe_timespec *tp);
 int isatty(int fd);
 unsigned int geteuid(void);
 ]]
@@ -274,7 +276,105 @@ end
 local TRASH_BASE_DIR = ""
 local TRASH_FILES_DIR = ""
 local TRASH_INFO_DIR = ""
-local LOG_FILE = ""
+local LOG_DIR = ""
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Fragment log helpers (undo log lives as one-file-per-action fragments).
+--
+-- WHY fragments instead of a single append log:
+--   On macOS, TCC (Transparency, Consent, Control) blocks read/write access
+--   to *existing files* inside ~/.Trash for any process that isn't a TCC-
+--   entitled binary (Finder, Terminal with Full Disk Access, etc.). Even
+--   as the file owner, even as admin, even with sudo. But TCC allows:
+--     - creating NEW files inside ~/.Trash,
+--     - reading/writing files the same process created,
+--     - creating/enumerating subdirectories the same process created.
+--   By writing one fragment per log_action() call, we never re-open a file
+--   somebody else wrote — every fragment is "ours" by TCC's per-process
+--   ownership model (via com.apple.macl xattr). The invariant "log dies
+--   when Trash is emptied" survives because the whole log dir lives inside
+--   ~/.Trash and gets nuked alongside everything else.
+--
+-- On Linux there is no TCC and this all just works — same code path.
+-- ─────────────────────────────────────────────────────────────────────────
+
+local _ts = ffi.new("struct rmsafe_timespec")
+local _log_counter = 0
+
+local function epoch_ns_str()
+	-- CLOCK_REALTIME is 0 on both macOS and Linux. Wall-clock nanos.
+	-- _log_counter guarantees uniqueness even if clock_gettime returns the
+	-- same nanosecond twice within one process (extremely rare but possible
+	-- on fast hardware / batch operations).
+	ffi.C.clock_gettime(0, _ts)
+	_log_counter = _log_counter + 1
+	-- Formatting as a plain string sidesteps LuaJIT double-precision limits
+	-- (2^53 ≈ 9e15, well below sec×1e9 ≈ 2e18).
+	return string.format("%d%09d-%04d",
+		tonumber(_ts.tv_sec),
+		tonumber(_ts.tv_nsec),
+		_log_counter)
+end
+
+local function pb_encode(s)
+	-- Shell out to `printable-binary` for a bijective, filesystem-safe
+	-- encoding of `s`. printable-binary encodes shell-special/whitespace
+	-- bytes to visible printable UTF-8 (/ → ⁄, space → ␣, & → ⅋, …) and is
+	-- bijective by construction. Cost: ~5ms per call. Batch-optimize later
+	-- if benchmarks warrant it. Falls back to raw `s` if the tool is
+	-- unavailable — undo will still work, just with weirder filenames.
+	if s == nil or s == "" then return "" end
+	local cmd = "printf '%s' " .. shell_quote(s) .. " | printable-binary 2>/dev/null"
+	local out = capture_stdout(cmd)
+	out = (out or ""):gsub("\n+$", "")
+	if out == "" then return s end
+	return out
+end
+
+local function sha256_hex_short(s)
+	-- Fallback filename token for pathologically-long paths whose encoded
+	-- form overflows the 255-byte fs limit. First 32 hex chars = 128 bits
+	-- of collision resistance, more than adequate for filename uniqueness.
+	local cmd = "printf '%s' " .. shell_quote(s) .. " | shasum -a 256 | awk '{print $1}'"
+	local out = capture_stdout(cmd)
+	out = (out or ""):gsub("%s+$", "")
+	if out == "" then return "unhashed" end
+	return out:sub(1, 32)
+end
+
+local function fragment_path_for(original_path)
+	-- Compute where the fragment for THIS action should live.
+	-- Filename: <epoch-ns>-<pb-encoded-original-path>
+	-- Overflow: <epoch-ns>-<sha256-32-hex>  (full path preserved in fragment contents)
+	if LOG_DIR == "" then return nil end
+	local ns = epoch_ns_str()
+	local encoded = pb_encode(original_path or "")
+	local name = ns .. "-" .. encoded
+	if #name > 200 then
+		name = ns .. "-" .. sha256_hex_short(original_path or "")
+	end
+	return path_join(LOG_DIR, name)
+end
+
+local function list_log_fragments()
+	-- Enumerate LOG_DIR entries via lfs. Returns a NAMES array (not paths).
+	-- Silently returns {} if LOG_DIR isn't set OR can't be enumerated. The
+	-- latter case is the TCC "different context" scenario: e.g., an agent
+	-- process running --undo won't see fragments a Terminal.app-with-FDA
+	-- process created. That's the correct degradation — each context sees
+	-- only what it itself trashed.
+	local names = {}
+	if LOG_DIR == "" then return names end
+	local ok = pcall(function()
+		for name in lfs.dir(LOG_DIR) do
+			if name ~= "." and name ~= ".." then
+				names[#names + 1] = name
+			end
+		end
+	end)
+	if not ok then return {} end
+	return names
+end
 
 local opts = {
 	force = false,
@@ -314,7 +414,7 @@ local function init()
 	end
 	TRASH_FILES_DIR = path_join(TRASH_BASE_DIR, "files")
 	TRASH_INFO_DIR = path_join(TRASH_BASE_DIR, "info")
-	LOG_FILE = path_join(TRASH_BASE_DIR, "rm_safe.log")
+	LOG_DIR = path_join(TRASH_BASE_DIR, "rm-safe-log")
 
 	local ok = mkdir_p(TRASH_FILES_DIR)
 	if not ok then
@@ -327,16 +427,19 @@ local function init()
 		exit_with(1)
 	end
 
-	if not touch_file(LOG_FILE) then
-		stderr_write("rm-safe: Warning: Cannot create log file: " .. LOG_FILE .. "\n")
-		LOG_FILE = ""
+	-- No warning if this fails: TCC-blocked contexts CAN'T create the log
+	-- dir but can still trash files. Log-write is best-effort; only its
+	-- absence changes user-visible behavior (undo won't find entries from
+	-- this session).
+	if not mkdir_p(LOG_DIR) then
+		LOG_DIR = ""
 	end
 
 	detect_capabilities()
 end
 
 local function log_action(action, path, trash_path, details)
-	if LOG_FILE == "" then
+	if LOG_DIR == "" then
 		return
 	end
 	trash_path = trash_path or "N/A"
@@ -352,7 +455,13 @@ local function log_action(action, path, trash_path, details)
 		trash_path,
 		details,
 	}, "\t") .. "\n"
-	local f = io.open(LOG_FILE, "ab")
+	-- Write ONE fragment per action. Filename encodes epoch-ns (sortable) and
+	-- the original path (browsable). Contents are the single TSV log line —
+	-- same format the old single-file log used, so the parse_log_line code
+	-- path stays intact.
+	local frag_path = fragment_path_for(path)
+	if frag_path == nil then return end
+	local f = io.open(frag_path, "wb")
 	if f then
 		f:write(line)
 		f:close()
@@ -383,17 +492,26 @@ local function parse_log_line(line)
 	return fields
 end
 
-local function reverse_log_lines(path)
-	local data = read_file(path)
-	if not data then
-		return nil
+local function reverse_log_lines(_)
+	-- Read every fragment in LOG_DIR, sort filenames DESC (= timestamp DESC
+	-- since names begin with epoch-ns), read each fragment's line, collect.
+	-- The single `_` param is a vestige of the old single-file signature and
+	-- is intentionally ignored — kept for call-site stability.
+	local names = list_log_fragments()
+	if #names == 0 then return nil end
+	table.sort(names, function(a, b) return a > b end)
+	local lines = {}
+	for _, name in ipairs(names) do
+		local frag_path = path_join(LOG_DIR, name)
+		local data = read_file(frag_path)
+		if data then
+			for line in data:gmatch("([^\n]+)") do
+				lines[#lines + 1] = line
+			end
+		end
 	end
-	local lines = split_lines(data)
-	local rev = {}
-	for i = #lines, 1, -1 do
-		rev[#rev + 1] = lines[i]
-	end
-	return rev
+	if #lines == 0 then return nil end
+	return lines
 end
 
 local function manual_trash_action()
@@ -418,10 +536,10 @@ local function parse_undo_offset(arg)
 end
 
 local function get_trash_manual_entry(offset, action_name)
-	if LOG_FILE == "" then
+	if LOG_DIR == "" then
 		return nil
 	end
-	local lines = reverse_log_lines(LOG_FILE)
+	local lines = reverse_log_lines(LOG_DIR)
 	if not lines then
 		return nil
 	end
@@ -481,8 +599,8 @@ end
 
 local function undo_with_offset(offset)
 	offset = offset or 1
-	if LOG_FILE == "" or not file_exists(LOG_FILE) then
-		stderr_write("rm-safe: Error: Log file not available for undo\n")
+	if LOG_DIR == "" or not file_exists(LOG_DIR) then
+		stderr_write("rm-safe: Error: Log directory not available for undo\n")
 		return false
 	end
 	local action_name = manual_trash_action()
@@ -548,15 +666,15 @@ local function undo_picker(offset_arg)
 		end
 	end
 
-	if LOG_FILE == "" or not file_exists(LOG_FILE) then
-		stderr_write("rm-safe: Error: Log file not available for undo\n")
+	if LOG_DIR == "" or not file_exists(LOG_DIR) then
+		stderr_write("rm-safe: Error: Log directory not available for undo\n")
 		return false
 	end
 
 	local action_name = manual_trash_action()
-	local lines = reverse_log_lines(LOG_FILE)
+	local lines = reverse_log_lines(LOG_DIR)
 	if not lines then
-		stderr_write("rm-safe: Error: Log file not available for undo\n")
+		stderr_write("rm-safe: Error: Log directory not available for undo\n")
 		return false
 	end
 
@@ -626,7 +744,11 @@ local function is_protected(path)
 		end
 	end
 
-	if path == TRASH_BASE_DIR or path == TRASH_FILES_DIR or path == TRASH_INFO_DIR or (LOG_FILE ~= "" and path == LOG_FILE) then
+	-- Protect the entire log fragments subtree, not just one file.
+	if path == TRASH_BASE_DIR or path == TRASH_FILES_DIR or path == TRASH_INFO_DIR then
+		return true
+	end
+	if LOG_DIR ~= "" and (path == LOG_DIR or path:sub(1, #LOG_DIR + 1) == LOG_DIR .. "/") then
 		return true
 	end
 
@@ -777,7 +899,7 @@ local function show_help()
 	local base_dir = TRASH_BASE_DIR ~= "" and TRASH_BASE_DIR or (get_trash_base() or "")
 	local file_dir = TRASH_FILES_DIR ~= "" and TRASH_FILES_DIR or path_join(base_dir, "files")
 	local info_dir = TRASH_INFO_DIR ~= "" and TRASH_INFO_DIR or path_join(base_dir, "info")
-	local log_path = LOG_FILE ~= "" and LOG_FILE or path_join(base_dir, "rm_safe.log")
+	local log_path = LOG_DIR ~= "" and LOG_DIR or path_join(base_dir, "rm-safe-log")
 	io.write(string.format([[rm-safe %s - Move files to trash instead of deleting
 
 Usage:

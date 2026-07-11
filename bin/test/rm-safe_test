@@ -56,13 +56,22 @@ fi
 
 TRASH_FILES="$TRASH_BASE/files"
 TRASH_INFO="$TRASH_BASE/info"
-LOG_FILE="$TRASH_BASE/rm_safe.log"
+LOG_DIR="$TRASH_BASE/rm-safe-log"
 
 reset_trash() {
-	mkdir -p "$TRASH_FILES" "$TRASH_INFO"
+	mkdir -p "$TRASH_FILES" "$TRASH_INFO" "$LOG_DIR"
 	find "$TRASH_FILES" -mindepth 1 -maxdepth 1 -exec "$REAL_RM" -rf {} + 2>/dev/null || true
 	find "$TRASH_INFO" -mindepth 1 -maxdepth 1 -exec "$REAL_RM" -rf {} + 2>/dev/null || true
-	: >"$LOG_FILE"
+	find "$LOG_DIR" -mindepth 1 -maxdepth 1 -exec "$REAL_RM" -rf {} + 2>/dev/null || true
+}
+
+# Concatenate all log fragments in temporal order (filenames start with
+# an epoch-ns timestamp, so lex sort == time sort). Reproduces what the
+# old single-file log used to give us in one `cat`.
+read_all_logs() {
+	if [[ -d "$LOG_DIR" ]]; then
+		find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f | sort | xargs cat 2>/dev/null
+	fi
 }
 
 skip_test() {
@@ -185,7 +194,7 @@ if [[ $RM_RC -ne 0 ]]; then
 	printf '%s\n' "$RM_ERR" >&2
 	((fails++))
 else
-	line=$(awk -F'\t' '$3=="TRASH_MANUAL"{line=$0} END{print line}' "$LOG_FILE")
+	line=$(read_all_logs | awk -F'\t' '$3=="TRASH_MANUAL"{line=$0} END{print line}')
 	if [[ -z $line ]]; then
 		echo "FAIL TRASH_MANUAL log entry missing" >&2
 		((fails++))
@@ -193,7 +202,7 @@ else
 		IFS=$'\t' read -r ts user action original trash_path details <<<"$line"
 		run_cmd --undo
 		if [[ $RM_RC -eq 0 && -e $original && ! -e $trash_path ]] && printf '%s' "$RM_ERR" | grep -F "Path $trash_path restored to $original successfully." >/dev/null; then
-			restore_line=$(tail -n 1 "$LOG_FILE")
+			restore_line=$(read_all_logs | tail -n 1)
 			IFS=$'\t' read -r rts ruser raction rsrc rdest rdetails <<<"$restore_line"
 			if [[ $raction == "TRASH_RESTORE" && $rsrc == "$trash_path" && $rdest == "$original" ]]; then
 				echo "OK --undo restores last TRASH_MANUAL"
