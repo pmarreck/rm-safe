@@ -78,7 +78,10 @@ get_trash_base() {
 TRASH_BASE_DIR=""
 TRASH_FILES_DIR=""
 TRASH_INFO_DIR=""
-LOG_FILE=""
+# Fragment-log design; see refactor commit 1167cc2 for the macOS TCC rationale.
+LOG_DIR=""
+_LOG_COUNTER=0
+_DATE_NS_CMD=""
 HAS_TAC=false
 _TAC_CMD=""
 HAS_GUM=false
@@ -180,17 +183,17 @@ init() {
 	TRASH_BASE_DIR=$(get_trash_base)
 	TRASH_FILES_DIR="$TRASH_BASE_DIR/files"
 	TRASH_INFO_DIR="$TRASH_BASE_DIR/info"
-	LOG_FILE="$TRASH_BASE_DIR/rm_safe.log"
+	LOG_DIR="$TRASH_BASE_DIR/rm-safe-log"
 
 	"$GMKDIR" -p "$TRASH_FILES_DIR" "$TRASH_INFO_DIR" 2>/dev/null || {
 		echo "rm-safe: Error: Cannot create trash directories" >&2
 		exit 1
 	}
 
-	touch "$LOG_FILE" 2>/dev/null || {
-		echo "rm-safe: Warning: Cannot create log file: $LOG_FILE" >&2
-		LOG_FILE=""
-	}
+	# Best-effort log dir; silently disable logging on failure (TCC-blocked
+	# contexts on macOS can't create files in existing paths under ~/.Trash
+	# but CAN create a fresh subdir). Trash still works either way.
+	"$GMKDIR" -p "$LOG_DIR" 2>/dev/null || LOG_DIR=""
 
 	detect_capabilities
 }
@@ -201,10 +204,80 @@ verbose() {
 	[[ ${VERBOSE:-false} == true ]] && echo "rm-safe: $*" >&2
 }
 
+# ─────────────────────────────────────────────────────────────────────────
+# Fragment log helpers — parallel implementation to bin/rm-safe (LuaJIT).
+# See commit 1167cc2 for the macOS TCC rationale. TL;DR: never re-open a
+# file another process wrote; each log_action writes its own fresh file.
+# ─────────────────────────────────────────────────────────────────────────
+
+_detect_date_ns() {
+	# Cache the ns-timestamp command choice. GNU date (Linux) has %N;
+	# BSD/macOS date does not, but coreutils' gdate does.
+	[[ -n "$_DATE_NS_CMD" ]] && return 0
+	if date +%s%N 2>/dev/null | grep -qE '^[0-9]{18,}$'; then
+		_DATE_NS_CMD="date"
+	elif command -v gdate >/dev/null 2>&1 && gdate +%s%N 2>/dev/null | grep -qE '^[0-9]{18,}$'; then
+		_DATE_NS_CMD="gdate"
+	else
+		# Fallback: sec×1e9 approximation. Loses uniqueness within a second,
+		# but _LOG_COUNTER still guarantees per-process uniqueness overall.
+		_DATE_NS_CMD="fallback"
+	fi
+}
+
+_epoch_ns_str() {
+	_detect_date_ns
+	local ns
+	case "$_DATE_NS_CMD" in
+		date)     ns=$(date +%s%N) ;;
+		gdate)    ns=$(gdate +%s%N) ;;
+		fallback) ns=$(printf '%s000000000' "$(date +%s)") ;;
+	esac
+	((_LOG_COUNTER++))
+	printf '%s-%04d' "$ns" "$_LOG_COUNTER"
+}
+
+_pb_encode() {
+	# Shell out to printable-binary for filesystem-safe bijective encoding.
+	# On failure (tool missing), echo input unchanged — undo still works,
+	# filenames just get weirder.
+	local s=$1 out
+	if [[ -z "$s" ]]; then echo ""; return; fi
+	if ! out=$(printf '%s' "$s" | printable-binary 2>/dev/null); then
+		printf '%s' "$s"; return
+	fi
+	# Strip trailing newline printable-binary emits
+	printf '%s' "${out%$'\n'}"
+}
+
+_sha256_hex_short() {
+	local s=$1 out
+	out=$(printf '%s' "$s" | shasum -a 256 2>/dev/null | awk '{print $1}')
+	[[ -z "$out" ]] && out="unhashed"
+	printf '%s' "${out:0:32}"
+}
+
+_fragment_path_for() {
+	# Compute the fragment path for a log_action call.
+	# Filename: <epoch-ns>-<counter>-<pb-encoded-path>
+	# Overflow (>200 bytes): <epoch-ns>-<counter>-<sha256:32> and preserve
+	# the full original path in the fragment's contents (`path` field).
+	[[ -z "$LOG_DIR" ]] && return 1
+	local original_path=$1
+	local ns encoded name
+	ns=$(_epoch_ns_str)
+	encoded=$(_pb_encode "$original_path")
+	name="$ns-$encoded"
+	if [[ ${#name} -gt 200 ]]; then
+		name="$ns-$(_sha256_hex_short "$original_path")"
+	fi
+	printf '%s/%s' "$LOG_DIR" "$name"
+}
+
 log_action() {
-	[[ -z $LOG_FILE ]] && return 0
+	[[ -z $LOG_DIR ]] && return 0
 	local action=$1 path=$2 trash_path=${3:-N/A} details=${4:-}
-	local timestamp
+	local timestamp frag_path
 
 	# Prefix action with TEST_ if in test mode
 	if [[ ${TEST_MODE:-false} == true ]]; then
@@ -212,9 +285,11 @@ log_action() {
 	fi
 
 	timestamp_utc_into timestamp '%Y-%m-%dT%H:%M:%SZ'
+	frag_path=$(_fragment_path_for "$path") || return 0
+	# Write once, close. No append, no re-open — that's the whole point.
 	printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
 		"$timestamp" \
-		"$USER_NAME" "$action" "$path" "$trash_path" "$details" >> "$LOG_FILE"
+		"$USER_NAME" "$action" "$path" "$trash_path" "$details" > "$frag_path"
 }
 
 # Check if running in an interactive terminal
@@ -222,22 +297,18 @@ is_interactive_terminal() {
 	[[ -t 0 && -t 1 ]]
 }
 
-# Reverse log lines in a portable way
+# Read all log fragments in the LOG_DIR in reverse chronological order.
+# Filenames start with an epoch-ns timestamp, so lex-sort DESC == time-sort
+# DESC. Each fragment contains ONE log line. The single arg is a vestige
+# of the old single-file signature and is intentionally ignored (call
+# sites pass "$LOG_DIR" or "$LOG_FILE" — either way we do the same thing).
 reverse_log_lines() {
-	local log_path=$1
-
-	[[ -f $log_path ]] || return 1
-
-	if [[ $HAS_TAC == true ]]; then
-		"${_TAC_CMD:-tac}" -- "$log_path"
-		return 0
-	fi
-
-	if tail -r "$log_path" 2>/dev/null; then
-		return 0
-	fi
-
-	awk '{lines[NR]=$0} END {for (i=NR; i>=1; i--) print lines[i]}' "$log_path"
+	[[ -z $LOG_DIR || ! -d $LOG_DIR ]] && return 1
+	# `sort -r` gives lexicographic descending; because filenames begin
+	# with epoch-ns, that's equivalent to newest-first.
+	find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null \
+		| sort -r \
+		| xargs cat 2>/dev/null
 }
 
 strip_ansi() {
@@ -288,7 +359,7 @@ get_trash_manual_entry() {
 				return 0
 			fi
 		fi
-	done < <(reverse_log_lines "$LOG_FILE")
+	done < <(reverse_log_lines "$LOG_DIR")
 
 	return 1
 }
@@ -343,8 +414,8 @@ undo_with_offset() {
 	local action_name
 	local line ts user action original_path trash_path details
 
-	if [[ -z $LOG_FILE || ! -f $LOG_FILE ]]; then
-		echo "rm-safe: Error: Log file not available for undo" >&2
+	if [[ -z $LOG_DIR || ! -d $LOG_DIR ]]; then
+		echo "rm-safe: Error: Log directory not available for undo" >&2
 		return 1
 	fi
 
@@ -385,18 +456,18 @@ undo_picker() {
 		fi
 	fi
 
-	if [[ -z $LOG_FILE || ! -f $LOG_FILE ]]; then
-		echo "rm-safe: Error: Log file not available for undo" >&2
+	if [[ -z $LOG_DIR || ! -d $LOG_DIR ]]; then
+		echo "rm-safe: Error: Log directory not available for undo" >&2
 		return 1
 	fi
 
 	action_name=$(manual_trash_action)
 	manual_lines=()
 	if [[ $BASH4 -eq 1 ]]; then
-		mapfile -t manual_lines < <(reverse_log_lines "$LOG_FILE" | awk -F'\t' -v action="$action_name" '$3==action')
+		mapfile -t manual_lines < <(reverse_log_lines "$LOG_DIR" | awk -F'\t' -v action="$action_name" '$3==action')
 	else
 		while IFS= read -r __line; do manual_lines+=("$__line"); done \
-			< <(reverse_log_lines "$LOG_FILE" 3>&- 4>&- | awk -F'\t' -v action="$action_name" '$3==action' 3>&- 4>&-)
+			< <(reverse_log_lines "$LOG_DIR" 3>&- 4>&- | awk -F'\t' -v action="$action_name" '$3==action' 3>&- 4>&-)
 	fi
 	if [[ ${#manual_lines[@]} -eq 0 ]]; then
 		echo "rm-safe: Error: No $action_name entries found to undo" >&2
@@ -540,8 +611,12 @@ is_protected() {
 	done
 
 	# Check if it's the trash itself
+	# Protect the entire fragment log subtree, not just one file.
 	[[ $path == "$TRASH_BASE_DIR" || $path == "$TRASH_FILES_DIR" ||
-	   $path == "$TRASH_INFO_DIR" || ( -n $LOG_FILE && $path == "$LOG_FILE" ) ]] && return 0
+	   $path == "$TRASH_INFO_DIR" ]] && return 0
+	if [[ -n $LOG_DIR && ( $path == "$LOG_DIR" || $path == "$LOG_DIR"/* ) ]]; then
+		return 0
+	fi
 
 	return 1
 }
@@ -742,7 +817,7 @@ show_help() {
 	local base_dir="${TRASH_BASE_DIR:-$(get_trash_base)}"
 	local file_dir="${TRASH_FILES_DIR:-$base_dir/files}"
 	local info_dir="${TRASH_INFO_DIR:-$base_dir/info}"
-	local log_path="${LOG_FILE:-$base_dir/rm_safe.log}"
+	local log_path="${LOG_DIR:-$base_dir/rm-safe-log}"
 
 	cat <<-EOF
 		rm-safe $SCRIPT_VERSION - Move files to trash instead of deleting
@@ -856,10 +931,9 @@ run_tests() {
 	local TRASH_BASE_DIR="$TEST_TRASH_DIR"
 	local TRASH_FILES_DIR="$TRASH_BASE_DIR/files"
 	local TRASH_INFO_DIR="$TRASH_BASE_DIR/info"
-	local LOG_FILE="$TRASH_BASE_DIR/rm_safe.log"
+	local LOG_DIR="$TRASH_BASE_DIR/rm-safe-log"
 
-	mkdir -p "$TRASH_FILES_DIR" "$TRASH_INFO_DIR"
-	touch "$LOG_FILE"
+	mkdir -p "$TRASH_FILES_DIR" "$TRASH_INFO_DIR" "$LOG_DIR"
 
 	# Cleanup function
 	cleanup_tests() {
