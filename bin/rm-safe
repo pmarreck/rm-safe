@@ -1,6 +1,5 @@
 #!/usr/bin/env luajit
 
-local lfs = require("lfs")
 local ffi = require("ffi")
 
 ffi.cdef[[
@@ -9,6 +8,164 @@ int clock_gettime(int clk_id, struct rmsafe_timespec *tp);
 int isatty(int fd);
 unsigned int geteuid(void);
 ]]
+
+-- >>> RM_SAFE_FS_SHIM_BEGIN
+-- Filesystem primitives over the LuaJIT FFI, replacing luafilesystem (lfs).
+--
+-- Why: rm-safe must run under ANY luajit. A bare interpreter -- the one a Nix
+-- flake dev shell puts first on PATH -- has no lfs, and rm-safe used to die at
+-- startup there with "module 'lfs' not found", i.e. inside project
+-- directories, which is exactly where it gets used most.
+--
+-- Why no `struct stat`: rm-safe only ever asks three questions of a path --
+-- does it exist, is it a directory, is it a symlink. access(2) and
+-- readlink(2) answer all three without reading a stat buffer, which sidesteps
+-- the `struct stat` layout differences between Linux x86_64 (st_mode at byte
+-- 24), Linux aarch64 (byte 16) and Darwin (byte 4, and only 16 bits wide),
+-- plus the stat64/__xstat/$INODE64 symbol variants. `dirent` is the one
+-- layout left, and bin/test/fs_shim_test pins it down.
+--
+-- The block between these markers is self-contained on purpose: fs_shim_test
+-- extracts it verbatim and diffs it against real lfs, so the differential
+-- test exercises the shipped code rather than a copy of it.
+local ffi = require("ffi") -- deliberate re-require; keeps this block extractable
+
+ffi.cdef[[
+int access(const char *path, int mode);
+long readlink(const char *path, char *buf, unsigned long bufsize);
+int mkdir(const char *path, unsigned int mode);
+char *getcwd(char *buf, unsigned long size);
+void *opendir(const char *name);
+int closedir(void *dirp);
+char *strerror(int errnum);
+]]
+
+-- `struct dirent` is the only layout we cannot design away. d_name sits at a
+-- different offset per platform, so declare it per-OS and let fs_shim_test
+-- verify it: a wrong offset cannot yield the "." and ".." every directory has.
+-- Caveat: on x86_64 Darwin the modern entry point is readdir$INODE64 and plain
+-- `readdir` is the legacy 32-bit-inode one. arm64 Darwin has only the modern
+-- symbol under the plain name, and arm64 is the only Mac target this project
+-- supports, so the plain name is correct here.
+if ffi.os == "OSX" then
+	ffi.cdef[[
+	struct rmsafe_dirent {
+		uint64_t d_ino;
+		uint64_t d_seekoff;
+		uint16_t d_reclen;
+		uint16_t d_namlen;
+		uint8_t  d_type;
+		char     d_name[1024];
+	};
+	struct rmsafe_dirent *readdir(void *dirp);
+	]]
+else
+	ffi.cdef[[
+	struct rmsafe_dirent {
+		uint64_t d_ino;
+		int64_t  d_off;
+		uint16_t d_reclen;
+		uint8_t  d_type;
+		char     d_name[256];
+	};
+	struct rmsafe_dirent *readdir(void *dirp);
+	]]
+end
+
+local fs = {}
+
+local F_OK = 0
+local MKDIR_MODE = 511 -- 0777; umask applies, matching lfs.mkdir
+local PATH_MAX = 4096
+local linkbuf = ffi.new("char[?]", PATH_MAX)
+local cwdbuf = ffi.new("char[?]", PATH_MAX)
+
+-- access(2) resolves with the REAL uid where stat(2) uses the effective one.
+-- The two only diverge for setuid binaries; sudo sets both, so this matches
+-- lfs.attributes for every way rm-safe is actually invoked.
+local function accessible(path)
+	return ffi.C.access(path, F_OK) == 0
+end
+
+-- Does `path` resolve to something, following symlinks? == lfs.attributes(p) ~= nil
+function fs.exists(path)
+	if path == nil or path == "" then return false end
+	return accessible(path)
+end
+
+-- Is `path` itself a symlink? readlink(2) fails with EINVAL on non-symlinks and
+-- ENOENT on missing paths, so its success alone is the answer -- no stat needed,
+-- and dangling symlinks still report true.
+function fs.is_link(path)
+	if path == nil or path == "" then return false end
+	return ffi.C.readlink(path, linkbuf, PATH_MAX) >= 0
+end
+
+-- Does the entry itself exist, dangling symlinks included?
+-- == lfs.symlinkattributes(p) ~= nil
+function fs.lexists(path)
+	if path == nil or path == "" then return false end
+	return fs.is_link(path) or accessible(path)
+end
+
+-- Does `path` resolve to a directory, following symlinks?
+-- == lfs.attributes(p, "mode") == "directory". Appending "/." is the
+-- struct-free test: it resolves only for directories and yields ENOTDIR
+-- for everything else.
+function fs.is_dir(path)
+	if path == nil or path == "" then return false end
+	return accessible(path .. "/.")
+end
+
+-- Is `path` a directory and not a symlink to one?
+-- == lfs.symlinkattributes(p).mode == "directory"
+function fs.is_dir_nolink(path)
+	if path == nil or path == "" then return false end
+	return not fs.is_link(path) and fs.is_dir(path)
+end
+
+-- Create a single directory. Mirrors lfs.mkdir's contract: true, or nil plus a
+-- message. Callers rely on the message to explain a failed trash-dir setup.
+function fs.mkdir(path)
+	if ffi.C.mkdir(path, MKDIR_MODE) == 0 then
+		return true
+	end
+	local en = ffi.errno()
+	return nil, ffi.string(ffi.C.strerror(en))
+end
+
+function fs.currentdir()
+	local p = ffi.C.getcwd(cwdbuf, PATH_MAX)
+	if p == nil then return nil end
+	return ffi.string(p)
+end
+
+-- Iterate entry names of `path`, "." and ".." included, exactly as lfs.dir does.
+-- Raises when the directory cannot be opened: rm-safe pcalls this, because an
+-- unreadable log dir is the macOS TCC "different context" case and must degrade
+-- to an empty listing rather than an error.
+function fs.dir(path)
+	local handle = ffi.C.opendir(path)
+	if handle == nil then
+		local en = ffi.errno()
+		error("cannot open " .. tostring(path) .. ": " .. ffi.string(ffi.C.strerror(en)), 2)
+	end
+	-- ffi.gc so an early `break` in the caller's loop still closes the handle.
+	local dirp = ffi.gc(handle, ffi.C.closedir)
+	local done = false
+	return function()
+		if done then return nil end
+		local entry = ffi.C.readdir(dirp)
+		if entry == nil then
+			done = true
+			ffi.gc(dirp, nil)
+			ffi.C.closedir(dirp)
+			return nil
+		end
+		return ffi.string(entry.d_name)
+	end
+end
+-- <<< RM_SAFE_FS_SHIM_END
 
 math.randomseed(os.time())
 
@@ -87,23 +244,10 @@ local function write_file(path, data)
 	return true
 end
 
-local function file_exists(path)
-	return lfs.attributes(path) ~= nil
-end
-
-local function path_exists(path)
-	return lfs.symlinkattributes(path) ~= nil
-end
-
-local function is_symlink(path)
-	local a = lfs.symlinkattributes(path)
-	return a and a.mode == "link"
-end
-
-local function is_directory_nonlink(path)
-	local a = lfs.symlinkattributes(path)
-	return a and a.mode == "directory"
-end
+local file_exists = fs.exists
+local path_exists = fs.lexists
+local is_symlink = fs.is_link
+local is_directory_nonlink = fs.is_dir_nolink
 
 local function basename(path)
 	if not path or path == "" then
@@ -146,11 +290,10 @@ local function mkdir_p(path)
 	if path == "/" then
 		return true
 	end
-	local mode = lfs.attributes(path, "mode")
-	if mode == "directory" then
+	if fs.is_dir(path) then
 		return true
 	end
-	if mode ~= nil and mode ~= "directory" then
+	if fs.exists(path) then
 		return nil, "not a directory"
 	end
 	local parent = dirname(path)
@@ -160,11 +303,11 @@ local function mkdir_p(path)
 			return nil, err
 		end
 	end
-	local ok, err = lfs.mkdir(path)
+	local ok, err = fs.mkdir(path)
 	if ok then
 		return true
 	end
-	if lfs.attributes(path, "mode") == "directory" then
+	if fs.is_dir(path) then
 		return true
 	end
 	return nil, err
@@ -205,13 +348,13 @@ end
 
 local function resolve_path(path)
 	if path == "" then
-		return lfs.currentdir()
+		return fs.currentdir()
 	end
 	local abs
 	if path:sub(1, 1) == "/" then
 		abs = path
 	else
-		abs = path_join(lfs.currentdir(), path)
+		abs = path_join(fs.currentdir(), path)
 	end
 	return normalize_absolute(abs)
 end
@@ -367,7 +510,7 @@ local function fragment_path_for(original_path)
 end
 
 local function list_log_fragments()
-	-- Enumerate LOG_DIR entries via lfs. Returns a NAMES array (not paths).
+	-- Enumerate LOG_DIR entries via the FFI shim. Returns a NAMES array (not paths).
 	-- Silently returns {} if LOG_DIR isn't set OR can't be enumerated. The
 	-- latter case is the TCC "different context" scenario: e.g., an agent
 	-- process running --undo won't see fragments a Terminal.app-with-FDA
@@ -376,7 +519,7 @@ local function list_log_fragments()
 	local names = {}
 	if LOG_DIR == "" then return names end
 	local ok = pcall(function()
-		for name in lfs.dir(LOG_DIR) do
+		for name in fs.dir(LOG_DIR) do
 			if name ~= "." and name ~= ".." then
 				names[#names + 1] = name
 			end
@@ -952,6 +1095,11 @@ local function run_tests()
 
 	local rc2 = shell_status(shell_quote(path_join(path_join(repo_root, "bin/test"), "rm_override_test")))
 	if rc2 ~= 0 then
+		fail = fail + 1
+	end
+
+	local rc3 = shell_status(shell_quote(path_join(path_join(repo_root, "bin/test"), "fs_shim_test")))
+	if rc3 ~= 0 then
 		fail = fail + 1
 	end
 

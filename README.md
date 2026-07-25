@@ -29,9 +29,10 @@ them. It works on the bash that ships with macOS (3.2) and on Linux.
 
 ### Optional upgrades
 
-- **Speed:** install **luajit** (with LuaFileSystem) and the shim automatically
-  uses the faster `bin/rm-safe`. Without luajit you'll see a one-time note
-  (silence it with `RM_SAFE_QUIET=1`).
+- **Speed:** install **luajit** and the shim automatically uses the faster
+  `bin/rm-safe`. Any luajit will do — no LuaFileSystem or other Lua rocks
+  needed, since `bin/rm-safe` reaches the filesystem through its own FFI shim.
+  Without luajit you'll see a one-time note (silence it with `RM_SAFE_QUIET=1`).
 - **Nix:** `nix develop` for a managed dev/test environment, or
   `nix build .#rm-safe` / `.#rm-safe-bash` for packaged builds.
 
@@ -42,10 +43,11 @@ specific implementation for both `rm` and the tests.
 
 Files
 - `bin/rm-safe.bash` — universal bash implementation; works on macOS bash 3.2 and Linux with no extra dependencies.
-- `bin/rm-safe` — faster LuaJIT implementation; used automatically when luajit+lfs is available.
+- `bin/rm-safe` — faster LuaJIT implementation; used automatically when any luajit is available (no Lua rocks required).
 - `bin/rm` — wrapper shim: dispatches `RM_SAFE_BIN` override → luajit → bash fallback → system rm; warns (suppressible via `RM_SAFE_QUIET=1`) when falling back.
 - `bin/test/rm-safe_test` — undo/restore tests.
 - `bin/test/rm_override_test` — shim tests.
+- `bin/test/fs_shim_test` — proves `bin/rm-safe` needs no LuaFileSystem, and diffs its FFI filesystem shim against real lfs.
 - `bin/test/run-all` — runs the full test suite across luajit / bash-4+ / bash-3.2 lanes.
 
 Platform notes

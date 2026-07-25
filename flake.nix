@@ -12,6 +12,11 @@
         pkgs = import nixpkgs { inherit system; };
         lib = pkgs.lib;
 
+        # rm-safe itself needs NOTHING but a bare luajit: bin/rm-safe reaches the
+        # filesystem through its own FFI shim rather than luafilesystem.
+        # luafilesystem survives only as a TEST dependency -- bin/test/fs_shim_test
+        # diffs the shim against real lfs, which is the independent oracle that
+        # keeps the shim honest. Never put luajitWithLfs on a runtime path.
         luajitWithLfs = pkgs.luajit.withPackages (ps: [ ps.luafilesystem ]);
 
         # g-prefixed GNU tools (mirrors ~/.config/nix/flake.nix): coreutils-prefixed
@@ -50,7 +55,7 @@
               cp bin/rm-safe $out/bin/rm-safe-luajit
               cp bin/rm-safe.bash $out/bin/rm-safe.bash
               cp bin/rm $out/bin/rm
-              makeWrapper ${luajitWithLfs}/bin/luajit $out/bin/rm-safe \
+              makeWrapper ${pkgs.luajit}/bin/luajit $out/bin/rm-safe \
                 --add-flags $out/bin/rm-safe-luajit \
                 --prefix PATH : ${lib.makeBinPath runtimeDeps}
               wrapProgram $out/bin/rm-safe.bash \
@@ -59,7 +64,7 @@
               # ($out/bin holds rm-safe + rm-safe.bash) and the runtime tools;
               # otherwise it would always fall back to the slower bash impl.
               wrapProgram $out/bin/rm \
-                --prefix PATH : ${luajitWithLfs}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
+                --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
             '';
           };
           rm-safe-bash = pkgs.stdenv.mkDerivation {

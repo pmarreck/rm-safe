@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+
+# Proves bin/rm-safe's LuaJIT implementation carries NO luafilesystem (lfs)
+# dependency, and that the FFI filesystem shim that replaced it agrees with
+# real lfs on every file type that matters.
+#
+# Three independent controls, weakest to strongest:
+#   1. static   — the source must not reference lfs at all
+#   2. differential — shim vs REAL lfs over a file-type corpus (independent
+#      oracle we did not write); plus oracle-free invariants that hold even
+#      where lfs is unavailable (every directory contains "." and "..")
+#   3. end-to-end — a real trash+restore round trip under interpreters that
+#      provably cannot load lfs (poisoned `require`, and a genuinely bare
+#      luajit when one is discoverable)
+#
+# Deliberately NOT `set -e`: commands under test are expected to fail.
+
+set -u
+
+fails=0
+tests=0
+skips=0
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# RM_SAFE_IMPL is a test-only knob used to point this suite at a deliberately
+# mutated copy of bin/rm-safe, to confirm these controls actually bite. Nothing
+# in run-all, --test or the flake check sets it.
+IMPL="${RM_SAFE_IMPL:-$REPO_ROOT/bin/rm-safe}"
+
+REAL_RM=$([ -x /bin/rm ] && echo /bin/rm || command -v rm || echo rm)
+TEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rm-safe-fsshim.XXXXXX")
+trap '"$REAL_RM" -rf "$TEST_DIR"' EXIT
+
+ok()   { echo "OK   $1"; }
+bad()  { echo "FAIL $1" >&2; ((fails++)); }
+skip() { echo "SKIP $1: $2" >&2; ((skips++)); }
+
+LUAJIT=$(command -v luajit 2>/dev/null || true)
+if [[ -z $LUAJIT ]]; then
+	echo "fs_shim_test: no luajit on PATH; the luajit impl is not exercisable here" >&2
+	skip "entire suite" "luajit not installed"
+	echo "=== fs_shim_test: $tests run, $fails failed, $skips skipped ==="
+	exit 0
+fi
+
+# Poison `require("lfs")` in ANY interpreter. This is the portable control:
+# it does not depend on finding an lfs-free luajit, so it runs identically on
+# Linux and macOS, Nix and non-Nix.
+POISON='local r = require; _G.require = function(n)
+	if n == "lfs" then error("module '"'"'lfs'"'"' not found (fs_shim_test harness)", 2) end
+	return r(n)
+end'
+
+# Locate a luajit that genuinely cannot load lfs. Order: explicit override,
+# then the unwrapped interpreter implied by the running luajit's default
+# cpath (nixpkgs wraps luajit.withPackages in a binary wrapper that re-sets
+# LUA_CPATH, so scrubbing the env is NOT enough), then plain luajit.
+find_bare_luajit() {
+	local c candidates=()
+	[[ -n ${RM_SAFE_BARE_LUAJIT:-} ]] && candidates+=("$RM_SAFE_BARE_LUAJIT")
+	while IFS= read -r c; do
+		[[ -n $c ]] && candidates+=("$c")
+	done < <("$LUAJIT" -e 'for p in package.cpath:gmatch("[^;]+") do
+		local d = p:match("^(.*)/lib/lua/5%.1/%?%.so$")
+		if d then print(d .. "/bin/luajit") end
+	end' 2>/dev/null)
+	candidates+=("$LUAJIT")
+	for c in "${candidates[@]}"; do
+		[[ -x $c ]] || continue
+		if ! "$c" -e 'require("lfs")' >/dev/null 2>&1; then
+			echo "$c"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# Control 1 (static): no lfs anywhere in the shipped source.
+# ---------------------------------------------------------------------------
+((tests++))
+# Strip Lua line comments first: the shim's doc comments legitimately cite the
+# lfs semantics they reproduce. Only live code counts as a dependency.
+LFS_HITS=$(sed 's/--.*$//' "$IMPL" | grep -nE 'require\(["'"'"']lfs["'"'"']\)|\blfs\.' || true)
+if [[ -n $LFS_HITS ]]; then
+	bad "static: bin/rm-safe still references lfs in live code"
+	printf '%s\n' "$LFS_HITS" | head -20 >&2
+else
+	ok "static: bin/rm-safe references no lfs in live code"
+fi
+
+# ---------------------------------------------------------------------------
+# Control 2 (differential + invariants): exercise the SHIPPED shim block,
+# extracted verbatim from bin/rm-safe between its markers.
+# ---------------------------------------------------------------------------
+SHIM_LUA="$TEST_DIR/shim.lua"
+awk '/RM_SAFE_FS_SHIM_BEGIN/{f=1; next} /RM_SAFE_FS_SHIM_END/{f=0} f' "$IMPL" >"$SHIM_LUA"
+printf '\nreturn fs\n' >>"$SHIM_LUA"
+
+((tests++))
+if ! grep -q 'RM_SAFE_FS_SHIM_BEGIN' "$IMPL" || ! grep -q 'RM_SAFE_FS_SHIM_END' "$IMPL"; then
+	bad "extract: no RM_SAFE_FS_SHIM_BEGIN/END block found in bin/rm-safe"
+	: >"$SHIM_LUA"
+elif (( $(wc -l <"$SHIM_LUA") < 10 )); then
+	bad "extract: shim block is implausibly short ($(wc -l <"$SHIM_LUA") lines)"
+	: >"$SHIM_LUA"
+else
+	ok "extract: shim block extracted ($(wc -l <"$SHIM_LUA" | tr -d ' ') lines)"
+fi
+
+cat >"$TEST_DIR/differential.lua" <<'LUAEOF'
+-- Compare the extracted shim against real lfs (when present) over a corpus
+-- of every file type rm-safe can encounter, plus oracle-free invariants.
+local shim_path, corpus = arg[1], arg[2]
+local fs = assert(loadfile(shim_path))()
+local have_lfs, lfs = pcall(require, "lfs")
+
+local fails, checks = 0, 0
+local function check(name, got, want)
+	checks = checks + 1
+	if got ~= want then
+		fails = fails + 1
+		io.stderr:write(string.format("  MISMATCH %s: got %s, want %s\n",
+			name, tostring(got), tostring(want)))
+	end
+end
+
+local paths = {
+	corpus .. "/reg",
+	corpus .. "/dir",
+	corpus .. "/link_to_reg",
+	corpus .. "/link_to_dir",
+	corpus .. "/dangling",
+	corpus .. "/fifo",
+	corpus .. "/missing",
+	corpus .. "/name with spaces.txt",
+	corpus .. "/naïve-ünïcode",
+	corpus .. "/dir/nested",
+	corpus,
+	"/",
+	"/etc/hostname",
+	"",
+}
+
+-- Oracle-free invariant: every real directory enumerates "." and "..".
+-- A wrong `struct dirent` d_name offset cannot survive this.
+for _, d in ipairs({ corpus, corpus .. "/dir", corpus .. "/empty_dir", "/" }) do
+	local seen = {}
+	local ok = pcall(function()
+		for name in fs.dir(d) do seen[name] = true end
+	end)
+	check("dir(" .. d .. ") opens", ok, true)
+	check("dir(" .. d .. ") yields '.'", seen["."], true)
+	check("dir(" .. d .. ") yields '..'", seen[".."], true)
+end
+
+-- Oracle-free invariant: dir() on a non-directory must RAISE (rm-safe relies
+-- on pcall'ing it for the macOS TCC degradation path).
+check("dir(regular file) raises", pcall(function()
+	for _ in fs.dir(corpus .. "/reg") do end
+end), false)
+check("dir(missing) raises", pcall(function()
+	for _ in fs.dir(corpus .. "/missing") do end
+end), false)
+
+-- mkdir: fresh succeeds, duplicate reports failure with a message.
+local fresh = corpus .. "/made_by_shim"
+check("mkdir fresh", fs.mkdir(fresh), true)
+check("mkdir fresh is a dir", fs.is_dir(fresh), true)
+local again, err = fs.mkdir(fresh)
+check("mkdir duplicate fails", not again, true)
+check("mkdir duplicate has error string", type(err) == "string" and #err > 0, true)
+
+-- currentdir
+check("currentdir is absolute", (fs.currentdir() or ""):sub(1, 1) == "/", true)
+
+if not have_lfs then
+	io.stderr:write("  (note: real lfs unavailable; differential comparison skipped)\n")
+else
+	check("currentdir == lfs.currentdir", fs.currentdir(), lfs.currentdir())
+	for _, p in ipairs(paths) do
+		local a  = lfs.attributes(p)
+		local sa = lfs.symlinkattributes(p)
+		check("exists " .. p,          fs.exists(p),         a ~= nil)
+		check("lexists " .. p,         fs.lexists(p),        sa ~= nil)
+		check("is_link " .. p,         fs.is_link(p),        sa ~= nil and sa.mode == "link")
+		check("is_dir " .. p,          fs.is_dir(p),         a ~= nil and a.mode == "directory")
+		check("is_dir_nolink " .. p,   fs.is_dir_nolink(p),  sa ~= nil and sa.mode == "directory")
+	end
+	-- dir() must enumerate exactly what lfs.dir does.
+	for _, d in ipairs({ corpus, corpus .. "/dir", corpus .. "/empty_dir" }) do
+		local mine, theirs = {}, {}
+		for n in fs.dir(d) do mine[#mine + 1] = n end
+		for n in lfs.dir(d) do theirs[#theirs + 1] = n end
+		table.sort(mine); table.sort(theirs)
+		check("dir(" .. d .. ") count", #mine, #theirs)
+		check("dir(" .. d .. ") contents", table.concat(mine, "\1"), table.concat(theirs, "\1"))
+	end
+end
+
+io.stderr:write(string.format("  differential: %d checks, %d mismatches%s\n",
+	checks, fails, have_lfs and "" or " (lfs-free host)"))
+os.exit(fails == 0 and 0 or 1)
+LUAEOF
+
+CORPUS="$TEST_DIR/corpus"
+mkdir -p "$CORPUS/dir/nested" "$CORPUS/empty_dir"
+echo "regular" >"$CORPUS/reg"
+echo "spaced"  >"$CORPUS/name with spaces.txt"
+echo "unicode" >"$CORPUS/naïve-ünïcode"
+ln -s "$CORPUS/reg" "$CORPUS/link_to_reg"
+ln -s "$CORPUS/dir" "$CORPUS/link_to_dir"
+ln -s "$CORPUS/nowhere-at-all" "$CORPUS/dangling"
+mkfifo "$CORPUS/fifo" 2>/dev/null || true
+
+((tests++))
+if [[ -s $SHIM_LUA ]]; then
+	if "$LUAJIT" "$TEST_DIR/differential.lua" "$SHIM_LUA" "$CORPUS"; then
+		ok "differential: shim agrees with lfs across the file-type corpus"
+	else
+		bad "differential: shim disagrees with lfs"
+	fi
+else
+	skip "differential" "no shim block to extract"
+fi
+
+# ---------------------------------------------------------------------------
+# Control 3 (end-to-end): trash + restore under interpreters without lfs.
+# ---------------------------------------------------------------------------
+# Force rm-safe's own manual trash path by making the external helpers fail,
+# exactly as rm-safe_test does; otherwise `gio trash` handles the delete and
+# logs TRASH_GIO, which --undo (TRASH_MANUAL only) will not restore.
+STUB_BIN="$TEST_DIR/stub-bin"
+mkdir -p "$STUB_BIN"
+for helper in gio trash-put; do
+	printf '#!/bin/sh\nexit 1\n' >"$STUB_BIN/$helper"
+	chmod +x "$STUB_BIN/$helper"
+done
+
+# $1 = label, $2 = interpreter, $3... = extra interpreter args (e.g. -e POISON)
+e2e_round_trip() {
+	local label=$1 interp=$2; shift 2
+	local sandbox="$TEST_DIR/e2e-$label"
+	local home="$sandbox/home" xdg="$sandbox/xdg" work="$sandbox/work"
+	mkdir -p "$home" "$xdg" "$work"
+
+	local victim="$work/victim.txt"
+	local payload="payload-$label-$$"
+	printf '%s\n' "$payload" >"$victim"
+
+	local out rc
+	out=$(env HOME="$home" XDG_DATA_HOME="$xdg" PATH="$STUB_BIN:$PATH" "$interp" "$@" "$IMPL" "$victim" 2>&1)
+	rc=$?
+	if (( rc != 0 )); then
+		bad "$label: trash failed (rc=$rc)"
+		printf '%s\n' "$out" | head -20 >&2
+		return 1
+	fi
+	if [[ -e $victim ]]; then
+		bad "$label: victim still present after trash"
+		return 1
+	fi
+
+	out=$(cd "$work" && env HOME="$home" XDG_DATA_HOME="$xdg" PATH="$STUB_BIN:$PATH" "$interp" "$@" "$IMPL" --undo 2>&1)
+	rc=$?
+	if (( rc != 0 )); then
+		bad "$label: --undo failed (rc=$rc)"
+		printf '%s\n' "$out" | head -20 >&2
+		return 1
+	fi
+	if [[ ! -f $victim ]]; then
+		bad "$label: --undo did not restore the file"
+		return 1
+	fi
+	if [[ $(cat "$victim") != "$payload" ]]; then
+		bad "$label: restored content differs"
+		return 1
+	fi
+	ok "$label: trash + --undo round trip with byte-identical content"
+	return 0
+}
+
+((tests++))
+e2e_round_trip "poisoned-require" "$LUAJIT" -e "$POISON"
+
+((tests++))
+BARE=$(find_bare_luajit || true)
+if [[ -n $BARE ]]; then
+	echo "     (bare interpreter: $BARE)"
+	e2e_round_trip "bare-luajit" "$BARE"
+else
+	skip "bare-luajit end-to-end" "every discoverable luajit can load lfs; poisoned-require control still ran"
+fi
+
+echo "=== fs_shim_test: $tests run, $fails failed, $skips skipped ==="
+exit $(( fails > 0 ? 1 : 0 ))

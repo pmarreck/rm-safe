@@ -9,6 +9,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SUITE="$REPO_ROOT/bin/test/rm-safe_test"
 OVERRIDE_SUITE="$REPO_ROOT/bin/test/rm_override_test"
+FS_SHIM_SUITE="$REPO_ROOT/bin/test/fs_shim_test"
 LUAJIT_IMPL="$REPO_ROOT/bin/rm-safe"
 BASH_IMPL="$REPO_ROOT/bin/rm-safe.bash"
 
@@ -65,13 +66,15 @@ run_lane() { # $1 = lane name, $2 = RM_SAFE_BIN wrapper
 
 skip_lane() { echo; echo "########## LANE: $1 — SKIPPED ($2) ##########"; }
 
-# luajit lane
-if [[ -x $LUAJIT_IMPL ]] && command -v luajit >/dev/null 2>&1 \
-	&& luajit -e 'require("lfs")' >/dev/null 2>&1; then
+# luajit lane. Deliberately does NOT require luafilesystem: the impl talks to
+# the filesystem through its own FFI shim now, so a bare luajit must work. The
+# old `require("lfs")` guard here silently skipped this lane on exactly the
+# hosts where rm-safe was broken.
+if [[ -x $LUAJIT_IMPL ]] && command -v luajit >/dev/null 2>&1; then
 	make_wrapper "$WRAP_DIR/luajit" "" "$LUAJIT_IMPL"
 	run_lane luajit "$WRAP_DIR/luajit"
 else
-	skip_lane luajit "luajit+lfs not available"
+	skip_lane luajit "luajit not available"
 fi
 
 # bash-4+ lane
@@ -90,6 +93,14 @@ if [[ -n $B3 ]]; then
 	run_lane bash32 "$WRAP_DIR/bash32"
 else
 	skip_lane bash32 "no bash 3.x found (expected on Linux)"
+fi
+
+# fs shim tests run once: they are specific to the luajit impl, not to a lane.
+# Self-skips when luajit is absent, so no guard is needed here.
+if [[ -z $WANT_LANE || $WANT_LANE == luajit ]]; then
+	echo; echo "########## fs_shim_test (luajit FFI filesystem shim) ##########"
+	lanes_run+=1
+	if ! $TIMEOUT_CMD "$FS_SHIM_SUITE"; then lanes_failed+=1; echo ">>> fs shim tests FAILED" >&2; fi
 fi
 
 # shim tests run once (implementation-agnostic)
