@@ -10,7 +10,11 @@ RM_SHIM="$REPO_ROOT/bin/rm"
 SELF="$RM_SHIM"
 
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rm-override-test.XXXXXX")
-trap 'rm -rf "$test_dir"' EXIT
+# Resolve a real rm the same way the other suites do: a bare `rm` here can
+# resolve to an rm-safe shim, which would move fixtures to the trash instead of
+# deleting them -- the suite would slowly fill the developer's Trash.
+REAL_RM=$([ -x /bin/rm ] && echo /bin/rm || command -v rm || echo rm)
+trap '"$REAL_RM" -rf "$test_dir"' EXIT
 
 # PATH must still contain bash/dirname/etc for the shim's shebang; avoid rm-safe presence
 PATH_SAFE="/usr/local/bin:/usr/bin:/bin"
@@ -23,12 +27,19 @@ mkdir -p "$LUAJIT_STUB_DIR"
 printf '#!/bin/sh\nexit 0\n' >"$LUAJIT_STUB_DIR/luajit"
 chmod +x "$LUAJIT_STUB_DIR/luajit"
 
-# A PATH guaranteed to have no luajit: filter out any PATH_SAFE dir that contains luajit.
-NO_LUAJIT_PATH=""
-IFS=: read -ra _dirs <<< "$PATH_SAFE"
-for _d in "${_dirs[@]}"; do
-	[[ -x "$_d/luajit" ]] || NO_LUAJIT_PATH="${NO_LUAJIT_PATH:+$NO_LUAJIT_PATH:}$_d"
+# A PATH guaranteed to have no luajit. Filtering PATH_SAFE per-directory is too
+# coarse: on NixOS bash and luajit share /run/current-system/sw/bin, so dropping
+# that directory also drops the `bash` the shim's `#!/usr/bin/env bash` needs.
+# The shim then never executes at all and the fallback assertions below fail for
+# a reason that has nothing to do with the behavior under test. Build a
+# symlink-only overlay instead: the tools the shim needs, and no luajit.
+NO_LUAJIT_DIR="$test_dir/no_luajit"
+mkdir -p "$NO_LUAJIT_DIR"
+for _c in bash dirname; do
+	_p=$(PATH="$PATH_SAFE" command -v "$_c" 2>/dev/null)
+	[[ -n $_p ]] && ln -sf -- "$_p" "$NO_LUAJIT_DIR/$_c"
 done
+NO_LUAJIT_PATH="$NO_LUAJIT_DIR"
 
 # helper: run command, capture stdout/stderr, exit status
 run_cmd() {
