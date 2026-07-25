@@ -321,13 +321,23 @@ local function pb_encode(s)
 	-- encoding of `s`. printable-binary encodes shell-special/whitespace
 	-- bytes to visible printable UTF-8 (/ → ⁄, space → ␣, & → ⅋, …) and is
 	-- bijective by construction. Cost: ~5ms per call. Batch-optimize later
-	-- if benchmarks warrant it. Falls back to raw `s` if the tool is
-	-- unavailable — undo will still work, just with weirder filenames.
+	-- if benchmarks warrant it.
 	if s == nil or s == "" then return "" end
 	local cmd = "printf '%s' " .. shell_quote(s) .. " | printable-binary 2>/dev/null"
 	local out = capture_stdout(cmd)
 	out = (out or ""):gsub("\n+$", "")
-	if out == "" then return s end
+	if out == "" then
+		-- printable-binary is not installed (it is not a documented dependency,
+		-- so this is the common case). Returning `s` verbatim used to look
+		-- harmless but kept its slashes, so the fragment path pointed into a
+		-- directory that does not exist, write_file failed silently, and the
+		-- action went unlogged -- the file was trashed with no way to --undo it.
+		-- Sanitize in pure Lua instead. U+2044 FRACTION SLASH is what
+		-- printable-binary itself maps "/" to, so names look the same either
+		-- way. This need not be reversible: uniqueness comes from the epoch-ns
+		-- prefix and the fragment CONTENT carries the authoritative path.
+		return (s:gsub("/", "\226\129\132"))
+	end
 	return out
 end
 

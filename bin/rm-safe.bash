@@ -239,12 +239,18 @@ _epoch_ns_str() {
 
 _pb_encode() {
 	# Shell out to printable-binary for filesystem-safe bijective encoding.
-	# On failure (tool missing), echo input unchanged — undo still works,
-	# filenames just get weirder.
+	# When the tool is missing (it is not a documented dependency, so this is
+	# the common case) fall back to a pure-bash sanitize. Echoing the input
+	# unchanged used to look harmless but kept its slashes, so the fragment
+	# path pointed into a directory that does not exist, the write failed
+	# silently, and the action went unlogged -- the file was trashed with no
+	# way to --undo it. U+2044 FRACTION SLASH is what printable-binary itself
+	# maps "/" to, so names look the same either way; the fallback need not be
+	# reversible because the fragment CONTENT carries the authoritative path.
 	local s=$1 out
 	if [[ -z "$s" ]]; then echo ""; return; fi
-	if ! out=$(printf '%s' "$s" | printable-binary 2>/dev/null); then
-		printf '%s' "$s"; return
+	if ! out=$(printf '%s' "$s" | printable-binary 2>/dev/null) || [[ -z "$out" ]]; then
+		printf '%s' "${s//\//⁄}"; return
 	fi
 	# Strip trailing newline printable-binary emits
 	printf '%s' "${out%$'\n'}"

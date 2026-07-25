@@ -146,6 +146,16 @@ run_cmd() {
 	RM_RC="$rc"
 }
 
+# Like run_cmd but with an explicit PATH, for exercising degraded environments.
+run_cmd_with_path() {
+	local path_override=$1; shift
+	local out err rc
+	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$path_override" rm-safe "$@"
+	RM_OUT="$out"
+	RM_ERR="$err"
+	RM_RC="$rc"
+}
+
 run_cmd_no_tty() {
 	local out err rc
 	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$PATH_BASE" bash -c 'rm-safe "$@"' _ "$@" </dev/null
@@ -332,6 +342,35 @@ if [[ -f "$TEST_DIR/gmktemp.trace" ]]; then
 else
 	echo "FAIL g-prefixed tool not preferred" >&2
 	((fails++))
+fi
+
+# Test: undo survives a missing `printable-binary`.
+# Regression guard. The fragment filename is built from pb_encode(original_path),
+# which shells out to printable-binary to make the path filesystem-safe (/ -> ⁄).
+# When that tool was absent the fallback returned the path UNCHANGED, so the
+# fragment name still contained slashes, the write landed in a nonexistent
+# directory and failed silently -- the file was trashed but no log fragment
+# existed, so --undo could never restore it. printable-binary is not a
+# documented dependency, so this was the default experience for most installs.
+reset_trash
+((tests++))
+echo "nopb-payload" >"$WORK_DIR/nopb.txt"
+NOPB_HOST_PATH=$(path_without_commands "$HOST_PATH" printable-binary)
+NOPB_PATH="$BIN_DIR:$BASH_DIR:$REPO_ROOT/bin:$NOPB_HOST_PATH"
+if env PATH="$NOPB_PATH" command -v printable-binary >/dev/null 2>&1; then
+	skip_test "missing printable-binary" "could not construct a PATH without printable-binary"
+else
+	run_cmd_with_path "$NOPB_PATH" "$WORK_DIR/nopb.txt"
+	nopb_rc=$RM_RC
+	nopb_line=$(read_all_logs | awk -F'\t' '$3=="TRASH_MANUAL"{line=$0} END{print line}')
+	run_cmd_with_path "$NOPB_PATH" --undo
+	if [[ $nopb_rc -eq 0 && -n $nopb_line && -f "$WORK_DIR/nopb.txt" \
+		&& $(cat "$WORK_DIR/nopb.txt") == "nopb-payload" ]]; then
+		echo "OK undo works without printable-binary installed"
+	else
+		echo "FAIL undo broken without printable-binary (trash rc=$nopb_rc, log entry: ${nopb_line:-<none>})" >&2
+		((fails++))
+	fi
 fi
 
 echo "=== Test Summary ==="
